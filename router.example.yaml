@@ -1,0 +1,31 @@
+project: single
+listen:
+  host: 127.0.0.1
+  port: 8787
+fleet:
+  - model: gemini-3.1-flash-lite
+    rpm: 15
+    rpd: 500
+    tpm: 250000
+    tier: bulk
+    alias: fast
+  - model: gemini-3.5-flash-lite
+    rpm: 15
+    rpd: 500
+    tpm: 250000
+    tier: bulk
+  - model: gemini-3.5-flash
+    rpm: 5
+    rpd: 20
+    tpm: 250000
+    tier: scarce
+pacing:
+  max_queue_wait_s: 30
+  burn_curve: even
+  max_in_flight_per_model: auto
+fallback:
+  strategy: remaining-budget
+learning:
+  auto_apply: false
+modalities: [chat]
+ledger_path: ./data/ledger.sqlite

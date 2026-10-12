@@ -1,0 +1,286 @@
+import type { FleetModel, QuotaSignal, ReserveResult } from "./types.ts";
+import { msUntilPtMidnight, ptDateKey } from "./time.ts";
+import type { PersistStore } from "./storage.ts";
+
+interface ModelState {
+  /** RPM sliding window: request timestamps (ms) */
+  rpm: number[];
+  /** TPM sliding window: {t, n} input-token entries (ms) */
+  tpm: Array<{ t: number; n: number }>;
+  rpd: number;
+  rpdDay: string;
+  inFlight: number;
+  /** learned limits self-corrected from 429 `limit:` payloads */
+  learned: { rpm?: number; rpd?: number; tpm?: number };
+  doneForDay: boolean;
+  /** cool-down after a minute-throttle 429 (ms epoch) */
+  coolUntil: number;
+}
+
+export interface LedgerSnapshot {
+  model: string;
+  configured: { rpm: number; rpd: number; tpm: number };
+  effective: { rpm: number; rpd: number; tpm: number };
+  used: { rpm: number; tpm: number; rpd: number; inFlight: number };
+  remaining: { rpm: number; tpm: number; rpd: number };
+  doneForDay: boolean;
+  msToPtReset: number;
+}
+
+const RPM_WINDOW_MS = 60_000;
+const TPM_WINDOW_MS = 60_000;
+
+export class QuotaLedger {
+  private states = new Map<string, ModelState>();
+  private fleet: FleetModel[];
+  private store: PersistStore;
+  private dirty = false;
+  private flushTimer?: ReturnType<typeof setInterval>;
+
+  constructor(fleet: FleetModel[], store: PersistStore, flushEveryMs = 5_000) {
+    this.fleet = fleet;
+    this.store = store;
+    for (const m of fleet) {
+      this.states.set(m.model, {
+        rpm: [],
+        tpm: [],
+        rpd: 0,
+        rpdDay: ptDateKey(),
+        inFlight: 0,
+        learned: {},
+        doneForDay: false,
+        coolUntil: 0,
+      });
+    }
+    this.restore();
+    if (flushEveryMs > 0) {
+      this.flushTimer = setInterval(() => this.flush(), flushEveryMs);
+      this.flushTimer.unref?.();
+    }
+  }
+
+  private model(model: string): ModelState | undefined {
+    return this.states.get(model);
+  }
+
+  private limits(model: FleetModel, s: ModelState) {
+    return {
+      rpm: s.learned.rpm ?? model.rpm,
+      rpd: s.learned.rpd ?? model.rpd,
+      tpm: s.learned.tpm ?? model.tpm,
+    };
+  }
+
+  /** Prune windows and roll the RPD day if PT midnight passed. */
+  private tick(s: ModelState, now = Date.now()) {
+    const day = ptDateKey(new Date(now));
+    if (s.rpdDay !== day) {
+      s.rpdDay = day;
+      s.rpd = 0;
+      s.doneForDay = false;
+    }
+    const cutoff = now - RPM_WINDOW_MS;
+    while (s.rpm.length && s.rpm[0] <= cutoff) s.rpm.shift();
+    const tcutoff = now - TPM_WINDOW_MS;
+    while (s.tpm.length && s.tpm[0].t <= tcutoff) s.tpm.shift();
+  }
+
+  private tpmUsed(s: ModelState): number {
+    let sum = 0;
+    for (const e of s.tpm) sum += e.n;
+    return sum;
+  }
+
+  /** Check headroom without reserving. */
+  canServe(modelName: string, estTokens: number, now = Date.now()): ReserveResult {
+    const m = this.fleet.find((x) => x.model === modelName);
+    const s = this.model(modelName);
+    if (!m || !s) return { ok: false, reason: "unknown-model" };
+    this.tick(s, now);
+    const lim = this.limits(m, s);
+    if (s.doneForDay) return { ok: false, doneForDay: true, reason: "done-for-day" };
+    if (now < s.coolUntil) return { ok: false, waitMs: s.coolUntil - now, reason: "cooldown" };
+    if (s.rpd >= lim.rpd) {
+      s.doneForDay = true;
+      return { ok: false, doneForDay: true, reason: "rpd-exhausted" };
+    }
+    const maxInFlight = Math.max(2, Math.floor(lim.rpm / 2));
+    if (s.inFlight >= maxInFlight) {
+      return { ok: false, waitMs: 1_000, reason: "in-flight-cap" };
+    }
+    if (s.rpm.length >= lim.rpm) {
+      const waitMs = s.rpm[0] + RPM_WINDOW_MS - now;
+      return { ok: false, waitMs: Math.max(waitMs, 100), reason: "rpm" };
+    }
+    if (this.tpmUsed(s) + estTokens > lim.tpm) {
+      const oldest = s.tpm[0];
+      const waitMs = oldest ? oldest.t + TPM_WINDOW_MS - now : 1_000;
+      return { ok: false, waitMs: Math.max(waitMs, 100), reason: "tpm" };
+    }
+    return { ok: true };
+  }
+
+  /** Atomically reserve quota (pre-increment). */
+  reserve(modelName: string, estTokens: number, now = Date.now()): ReserveResult {
+    const check = this.canServe(modelName, estTokens, now);
+    if (!check.ok) return check;
+    const s = this.model(modelName)!;
+    s.rpm.push(now);
+    s.tpm.push({ t: now, n: estTokens });
+    s.rpd += 1;
+    s.inFlight += 1;
+    this.dirty = true;
+    return { ok: true };
+  }
+
+  /** Client cancelled before completion — roll back the reservation. */
+  release(modelName: string, estTokens: number): void {
+    const s = this.model(modelName);
+    if (!s) return;
+    s.inFlight = Math.max(0, s.inFlight - 1);
+    s.rpd = Math.max(0, s.rpd - 1);
+    if (s.rpm.length) s.rpm.pop();
+    const last = s.tpm[s.tpm.length - 1];
+    if (last && last.n === estTokens) s.tpm.pop();
+    this.dirty = true;
+  }
+
+  /** Successful call: replace estimated input tokens with actual. */
+  commit(modelName: string, estTokens: number, actualInputTokens: number): void {
+    const s = this.model(modelName);
+    if (!s) return;
+    s.inFlight = Math.max(0, s.inFlight - 1);
+    for (let i = s.tpm.length - 1; i >= 0; i--) {
+      if (s.tpm[i].n === estTokens) {
+        s.tpm[i].n = actualInputTokens;
+        break;
+      }
+    }
+    this.dirty = true;
+  }
+
+  /** 429 arrived: undo the reservation (it didn't count as completed usage). */
+  unreserve(modelName: string, estTokens: number): void {
+    this.release(modelName, estTokens);
+  }
+
+  markDoneForDay(modelName: string): void {
+    const s = this.model(modelName);
+    if (!s) return;
+    s.doneForDay = true;
+    this.dirty = true;
+  }
+
+  /** Minute-throttle: cool the model for retryDelay without burning a slot. */
+  setCooldown(modelName: string, ms: number, now = Date.now()): void {
+    const s = this.model(modelName);
+    if (!s) return;
+    s.coolUntil = Math.max(0, now + ms);
+    this.dirty = true;
+  }
+
+  /** Apply self-learned limit from a 429 payload. */
+  applySignal(signal: QuotaSignal, modelName?: string): void {
+    const name = modelName ?? signal.model;
+    if (!name || signal.learnedLimit === undefined) return;
+    const s = this.model(name);
+    const m = this.fleet.find((x) => x.model === name);
+    if (!s || !m) return;
+    const lim = signal.learnedLimit;
+    if (signal.kind === "daily" && lim !== s.learned.rpd) {
+      s.learned.rpd = lim;
+      this.dirty = true;
+    } else if (signal.kind === "token_minute" && lim !== s.learned.tpm) {
+      // `limit:` for token metrics is tokens/min
+      s.learned.tpm = lim;
+      this.dirty = true;
+    } else if (signal.kind === "minute" && lim !== s.learned.rpm) {
+      s.learned.rpm = lim;
+      this.dirty = true;
+    }
+  }
+
+  /** Models with headroom, ordered by remaining RPD desc (remaining-budget strategy). */
+  candidates(estTokens: number, preferTier?: string, now = Date.now()): FleetModel[] {
+    const eligible = this.fleet.filter((m) => this.canServe(m.model, estTokens, now).ok);
+    const rank = (m: FleetModel) => {
+      const s = this.model(m.model)!;
+      const lim = this.limits(m, s);
+      const remaining = Math.max(0, lim.rpd - s.rpd);
+      const tierBoost = preferTier && m.tier === preferTier ? 1_000_000 : 0;
+      return tierBoost + remaining;
+    };
+    return eligible.sort((a, b) => rank(b) - rank(a));
+  }
+
+  nextPtResetMs(now = Date.now()): number {
+    return msUntilPtMidnight(new Date(now));
+  }
+
+  /** Smallest wait across the fleet before some model gains headroom. */
+  minWaitMs(estTokens: number, now = Date.now()): number {
+    let min = Number.POSITIVE_INFINITY;
+    for (const m of this.fleet) {
+      const r = this.canServe(m.model, estTokens, now);
+      if (r.ok) return 0;
+      if (r.doneForDay) continue;
+      if (typeof r.waitMs === "number") min = Math.min(min, r.waitMs);
+    }
+    return Number.isFinite(min) ? min : this.nextPtResetMs(now);
+  }
+
+  snapshot(): LedgerSnapshot[] {
+    const now = Date.now();
+    return this.fleet.map((m) => {
+      const s = this.model(m.model)!;
+      this.tick(s, now);
+      const lim = this.limits(m, s);
+      return {
+        model: m.model,
+        configured: { rpm: m.rpm, rpd: m.rpd, tpm: m.tpm },
+        effective: lim,
+        used: { rpm: s.rpm.length, tpm: this.tpmUsed(s), rpd: s.rpd, inFlight: s.inFlight },
+        remaining: {
+          rpm: Math.max(0, lim.rpm - s.rpm.length),
+          tpm: Math.max(0, lim.tpm - this.tpmUsed(s)),
+          rpd: Math.max(0, lim.rpd - s.rpd),
+        },
+        doneForDay: s.doneForDay,
+        msToPtReset: this.nextPtResetMs(now),
+      };
+    });
+  }
+
+  flush(): void {
+    if (!this.dirty) return;
+    const data: Record<string, unknown> = { day: ptDateKey(), models: {} };
+    for (const [k, s] of this.states) {
+      (data.models as Record<string, unknown>)[k] = { ...s, rpm: [], tpm: [], inFlight: 0 };
+    }
+    this.store.save(data);
+    this.dirty = false;
+  }
+
+  private restore(): void {
+    const data = this.store.load();
+    if (!data || typeof data !== "object") return;
+    const day = ptDateKey();
+    if (data.day !== day) return; // fresh PT day — start clean
+    const models = data.models as Record<string, Partial<ModelState>> | undefined;
+    if (!models) return;
+    for (const [k, saved] of Object.entries(models)) {
+      const s = this.states.get(k);
+      if (!s) continue;
+      s.rpd = typeof saved.rpd === "number" ? saved.rpd : 0;
+      s.rpdDay = typeof saved.rpdDay === "string" ? saved.rpdDay : day;
+      s.doneForDay = Boolean(saved.doneForDay);
+      s.learned = saved.learned ?? {};
+    }
+  }
+
+  close(): void {
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    this.flush();
+    this.store.close();
+  }
+}
