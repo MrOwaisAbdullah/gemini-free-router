@@ -1,6 +1,6 @@
 {
   "name": "gemini-free-router",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Squeeze 100% out of Gemini's free tier - per-model RPM/RPD/TPM scheduling for a single API key",
   "type": "module",
   "license": "MIT",
@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/cli.ts",
     "test": "node --test \"test/*.test.ts\"",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
   },
   "keywords": [
     "gemini",
@@ -29,6 +30,7 @@
   "dependencies": {
     "@hono/node-server": "^2.1.4",
     "hono": "^4.13.13",
+    "undici": "^7.30.0",
     "yaml": "^2.9.1"
   },
   "devDependencies": {

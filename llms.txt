@@ -7,14 +7,18 @@ An OpenAI-compatible proxy that runs on one Gemini API key and squeezes ~100% of
 Features (v0.2):
 - OpenAI-compatible proxy (non-streaming + SSE streaming)
 - Quota ledger: RPM (60s sliding window), RPD (PT midnight Pacific reset), TPM (input tokens)
-- 429 forensics: classifies daily/minute/token-minute; self-learning `limit: N` from payloads
-- Fallback engine: re-ranked by remaining daily budget
+- 429 forensics: classifies daily/minute/token-minute from quotaMetric (wins over quotaId) + RetryInfo + `limit:` text; self-learning `limit: N`; unclassifiable payloads get a capped, jittered 1s-60s backoff
+- Fallback engine: re-ranked by remaining daily budget × rolling quality (EMA of success rate + latency)
+- Jittered router-owned timers (queue polls, ledger flush, backoff); Google's retryDelay is honored exactly
+- Structured JSON logs on stderr (`GFR_LOG=debug|info|warn|error|off`) with a `quota_signal` event per parsed 429
+- Keep-alive connection pool toward Google (undici Agent; `GFR_POOL_CONNECTIONS` / `GFR_POOL_KEEPALIVE_MS`)
+- Golden 429 fixture corpus (`test/fixtures/429-corpus.json`) as the forensics regression net
 - 9-model free-tier fleet + 2 embedding models
 - `/v1/models`, `/v1/chat/completions`, `/healthz`, `/admin`, `/metrics`, `/admin/simulate`, `/v1/embeddings` endpoints
-- `x-gfr-tier` / `x-gfr-priority: hard` QoS headers
-- `GFR_DRY_RUN=1` flag for synthetic responses
+- `x-gfr-tier: bulk|standard|scarce` QoS header
+- `GFR_DRY_RUN=1` flag for synthetic responses (no upstream call, no quota spent; response carries `x-gfr-dry-run: 1`)
 - Client-disconnect upstream abort (saves wasted TPM)
-- Burn-rate curve: `even` (hourly cap = ceil(rpd/24)) / `front-loaded` (no hourly cap)
+- Burn-rate curve: `even` (allows `max(1, ceil(elapsed/24h A- rpd))` so far) / `front-loaded` (no pacing)
 - TypeScript + Hono on Node 22 with node:sqlite WAL ledger
 
 Spec: SPEC.md

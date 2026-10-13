@@ -1,0 +1,20 @@
+# Keep the build context small: the image only needs package*.json + src/.
+node_modules
+npm-debug.log*
+.git
+.github
+data
+docs
+test
+skills
+.claude
+*.log
+*.err
+smoke-*.json
+smoke-*.mjs
+smoke.ps1
+Dockerfile
+.dockerignore
+README.md
+SPEC.md
+llms.txt

@@ -1,0 +1,8 @@
+{
+  "project": "smoke",
+  "listen": { "host": "127.0.0.1", "port": 8791 },
+  "gemini": { "base_url": "http://127.0.0.1:9999/v1beta", "api_key_env": "GEMINI_API_KEY" },
+  "fleet": [{ "model": "gem-a", "rpm": 10, "rpd": 500, "tpm": 100000, "tier": "bulk" }],
+  "pacing": { "max_queue_wait_s": 0, "burn_curve": "front-loaded", "max_in_flight_per_model": "auto" },
+  "ledger_path": "./data/smoke-ledger.json"
+}

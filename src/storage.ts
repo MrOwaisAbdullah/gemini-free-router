@@ -34,6 +34,18 @@ export class JsonStore implements PersistStore {
   close(): void {}
 }
 
+/** Volatile in-memory store — used by simulators so dry runs never touch disk. */
+export class MemoryStore implements PersistStore {
+  private data: Record<string, unknown> | null = null;
+  load(): Record<string, unknown> | null {
+    return this.data;
+  }
+  save(data: Record<string, unknown>): void {
+    this.data = data;
+  }
+  close(): void {}
+}
+
 interface SqliteDb {
   run(sql: string, ...params: unknown[]): unknown;
   query(sql: string): { get(...params: unknown[]): unknown };

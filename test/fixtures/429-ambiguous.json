@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": 429,
+    "message": "The system is busy and cannot process the request right now. Please try again later.",
+    "status": "RESOURCE_EXHAUSTED"
+  }
+}

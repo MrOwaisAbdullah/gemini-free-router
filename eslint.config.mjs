@@ -11,4 +11,12 @@ export default tseslint.config(
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
     },
   },
+  // Plain-JS/ESM scripts (bin/, smoke tools) run on Node: typescript-eslint
+  // disables no-undef only for TS files, so declare the Node globals here.
+  {
+    files: ["**/*.mjs", "**/*.js"],
+    languageOptions: {
+      globals: { process: "readonly", console: "readonly", Buffer: "readonly", __dirname: "readonly" },
+    },
+  },
 );

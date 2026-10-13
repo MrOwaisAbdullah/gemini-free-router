@@ -67,7 +67,10 @@ export function classify429(body: unknown): QuotaSignal {
   }
 
   const quotaId = signal.quotaId ?? "";
-  const metric = signal.quotaMetric ?? "";
+  // `quotaMetric` can also appear only inside the message text — Google omits
+  // the whole `details` array on some 429s (the "missing details" fixture).
+  const metric = signal.quotaMetric ?? message.match(/metric:\s*([\w./-]+)/i)?.[1] ?? "";
+  if (metric) signal.quotaMetric = metric;
 
   const idSaysDay = /PerDay/i.test(quotaId);
   const idSaysMinute = /PerMinute/i.test(quotaId);
@@ -75,22 +78,29 @@ export function classify429(body: unknown): QuotaSignal {
   const metricSaysTokens = /input_token_count|tokens/i.test(metric);
   const metricSaysRequests = /_requests$|free_tier_requests/i.test(metric);
 
-  if (idSaysDay && !idSaysMinute) {
-    // PerDay quotaId is authoritative even when Google's retryDelay is short.
-    signal.kind = "daily";
-  } else if (idSaysDay && idSaysMinute) {
-    signal.kind = (retryDelayMs ?? 0) >= DAILY_RETRY_THRESHOLD_MS ? "daily" : "minute";
-  } else if (idSaysTokens || metricSaysTokens) {
+  // Family (tokens vs requests): quotaMetric wins over quotaId when they
+  // disagree (SPEC §130); the metric is only skipped when it says nothing
+  // about the family. Day/minute is a sub-question of the requests family.
+  const familyFromMetric = metricSaysTokens ? "tokens" : metricSaysRequests ? "requests" : null;
+  const familyFromId = idSaysTokens ? "tokens" : idSaysDay || idSaysMinute ? "requests" : null;
+  const family = familyFromMetric ?? familyFromId;
+
+  const messageHours = /retry in\s+[\d.]+\s*h(?:ou)?r/i.test(message);
+  const delay = retryDelayMs ?? -1;
+
+  if (family === "tokens") {
     signal.kind = "token_minute";
-  } else if (idSaysMinute || (metricSaysRequests && !metricSaysTokens)) {
-    signal.kind = (retryDelayMs ?? 0) >= DAILY_RETRY_THRESHOLD_MS ? "daily" : "minute";
-  } else if ((retryDelayMs ?? 0) >= DAILY_RETRY_THRESHOLD_MS) {
+  } else if (family === "requests") {
+    signal.kind = idSaysDay || messageHours || delay >= DAILY_RETRY_THRESHOLD_MS ? "daily" : "minute";
+  } else if (delay >= DAILY_RETRY_THRESHOLD_MS || messageHours) {
     signal.kind = "daily";
-  } else if (limitMatch || msgRetry || violation) {
-    // Some quota signal present but unclassifiable — treat as minute throttle.
+  } else if (retryDelayMs !== undefined) {
+    // No quota family at all, but Google told us when to come back → bounded
+    // throttle. Covers `retryDelay: 0s` too (floored to 5s below: never spin).
     signal.kind = "minute";
   }
-  // else: stays "unknown"
+  // else: genuinely ambiguous (no metric, no quotaId, no delay) → stays
+  // "unknown"; the server applies a capped, jittered exponential backoff.
 
   signal.retryDelayMs = Math.max(retryDelayMs ?? MIN_RETRY_FLOOR_MS, MIN_RETRY_FLOOR_MS);
   return signal;

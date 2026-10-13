@@ -1,5 +1,5 @@
 import type { FleetModel, QuotaSignal, ReserveResult } from "./types.ts";
-import { msUntilPtMidnight, ptDateKey } from "./time.ts";
+import { jitter, msUntilPtMidnight, ptDateKey } from "./time.ts";
 import type { PersistStore } from "./storage.ts";
 
 interface ModelState {
@@ -15,6 +15,21 @@ interface ModelState {
   doneForDay: boolean;
   /** cool-down after a minute-throttle 429 (ms epoch) */
   coolUntil: number;
+  /** rolling quality for fallback re-ranking (SPEC §7.4) */
+  quality: QualityStats;
+}
+
+/** Rolling success/latency EMA used to break ties between eligible models. */
+interface QualityStats {
+  emaOk: number;
+  emaLatencyMs: number;
+  samples: number;
+}
+
+export interface QualitySnapshot {
+  success: number;
+  latency_ms: number;
+  samples: number;
 }
 
 export interface LedgerSnapshot {
@@ -25,10 +40,22 @@ export interface LedgerSnapshot {
   remaining: { rpm: number; tpm: number; rpd: number };
   doneForDay: boolean;
   msToPtReset: number;
+  quality: QualitySnapshot;
 }
 
 const RPM_WINDOW_MS = 60_000;
 const TPM_WINDOW_MS = 60_000;
+
+/** EMA weight per observation — ~3 observations to move halfway to a verdict. */
+const QUALITY_ALPHA = 0.2;
+/** Below this many observations we stay neutral (0.5) instead of guessing. */
+const QUALITY_MIN_SAMPLES = 3;
+/** Latency at which a 100%-successful model scores 0.5 (vs 1.0 at 0ms). */
+const QUALITY_LATENCY_REF_MS = 2_000;
+
+const neutralQuality = (): QualityStats => ({ emaOk: 0.5, emaLatencyMs: 0, samples: 0 });
+
+const round3 = (n: number): number => Math.round(n * 1000) / 1000;
 
 export class QuotaLedger {
   private states = new Map<string, ModelState>();
@@ -52,11 +79,13 @@ export class QuotaLedger {
         learned: {},
         doneForDay: false,
         coolUntil: 0,
+        quality: neutralQuality(),
       });
     }
     this.restore();
     if (flushEveryMs > 0) {
-      this.flushTimer = setInterval(() => this.flush(), flushEveryMs);
+      // Jittered (SPEC §7.3) so N routers sharing a disk don't flush in lockstep.
+      this.flushTimer = setInterval(() => this.flush(), jitter(flushEveryMs));
       this.flushTimer.unref?.();
     }
   }
@@ -191,6 +220,35 @@ export class QuotaLedger {
     this.dirty = true;
   }
 
+  /**
+   * Record an upstream outcome for rolling quality (SPEC §7.4).
+   * Call with `ok=false` for upstream 429/5xx/transport failures and
+   * `ok=true` for any completed upstream response.
+   */
+  noteOutcome(modelName: string, ok: boolean, latencyMs: number): void {
+    const s = this.model(modelName);
+    if (!s || !Number.isFinite(latencyMs)) return;
+    const q = s.quality;
+    const value = ok ? 1 : 0;
+    q.emaOk += QUALITY_ALPHA * (value - q.emaOk);
+    q.emaLatencyMs += QUALITY_ALPHA * (Math.max(0, latencyMs) - q.emaLatencyMs);
+    q.samples += 1;
+    this.dirty = true;
+  }
+
+  /**
+   * Quality factor in `[0, 1]`; neutral 0.5 until we've seen enough traffic.
+   * Rank weight is `remaining * (0.5 + q)` — so an untouched model scores
+   * 1.0× its remaining budget (pre-quality behaviour), a perfect model up to
+   * 1.5×, and a failing one down to 0.5×. Budget still dominates: quality
+   * only re-ranks models with comparable remaining quota.
+   */
+  private qualityScore(s: ModelState): number {
+    if (s.quality.samples < QUALITY_MIN_SAMPLES) return 0.5;
+    const latencyFactor = QUALITY_LATENCY_REF_MS / (QUALITY_LATENCY_REF_MS + s.quality.emaLatencyMs);
+    return Math.max(0, Math.min(1, s.quality.emaOk * latencyFactor));
+  }
+
   /** Apply self-learned limit from a 429 payload. */
   applySignal(signal: QuotaSignal, modelName?: string): void {
     const name = modelName ?? signal.model;
@@ -212,7 +270,7 @@ export class QuotaLedger {
     }
   }
 
-  /** Models with headroom, ordered by remaining RPD desc (remaining-budget strategy). */
+  /** Models with headroom, ordered by remaining RPD desc, re-ranked by rolling quality (SPEC §7.4). */
   candidates(estTokens: number, preferTier?: string, now = Date.now()): FleetModel[] {
     const eligible = this.fleet.filter((m) => this.canServe(m.model, estTokens, now).ok);
     const rank = (m: FleetModel) => {
@@ -220,7 +278,7 @@ export class QuotaLedger {
       const lim = this.limits(m, s);
       const remaining = Math.max(0, lim.rpd - s.rpd);
       const tierBoost = preferTier && m.tier === preferTier ? 1_000_000 : 0;
-      return tierBoost + remaining;
+      return tierBoost + remaining * (0.5 + this.qualityScore(s));
     };
     return eligible.sort((a, b) => rank(b) - rank(a));
   }
@@ -259,6 +317,11 @@ export class QuotaLedger {
         },
         doneForDay: s.doneForDay,
         msToPtReset: this.nextPtResetMs(now),
+        quality: {
+          success: round3(s.quality.emaOk),
+          latency_ms: round3(s.quality.emaLatencyMs),
+          samples: s.quality.samples,
+        },
       };
     });
   }
@@ -287,6 +350,14 @@ export class QuotaLedger {
       s.rpdDay = typeof saved.rpdDay === "string" ? saved.rpdDay : day;
       s.doneForDay = Boolean(saved.doneForDay);
       s.learned = saved.learned ?? {};
+      const q = saved.quality;
+      if (q && typeof q === "object" && typeof q.samples === "number" && q.samples > 0) {
+        s.quality = {
+          emaOk: typeof q.emaOk === "number" ? q.emaOk : 0.5,
+          emaLatencyMs: typeof q.emaLatencyMs === "number" ? q.emaLatencyMs : 0,
+          samples: Math.floor(q.samples),
+        };
+      }
     }
   }
 

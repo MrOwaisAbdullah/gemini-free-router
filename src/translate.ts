@@ -141,10 +141,10 @@ export function geminiChunkToOpenAI(
       },
     ],
   };
-  if (done && includeUsage) {
-    // usage info is embedded in the final chunk per OpenAI spec
-    // we extract it from the Gemini response if available
-  }
+  // OpenAI sends `usage: null` on every content chunk when
+  // stream_options.include_usage is set; the real counts arrive in a final
+  // empty-choices chunk (emitted by server.ts after the stream drains).
+  if (includeUsage) chunk.usage = null;
   return chunk;
 }
 
