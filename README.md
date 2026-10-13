@@ -41,15 +41,19 @@ print(client.chat.completions.create(
 
 - `POST /v1/chat/completions` — OpenAI-compatible, streaming (SSE) and non-streaming
 - `GET /v1/models` — configured fleet (+ aliases)
-- `GET /admin` — per-model remaining budget, PT-reset countdown, learned limits
+- `GET /admin` — per-model remaining budget, PT-reset countdown, learned limits (JSON or HTML Accept header)
 - `GET /metrics` — Prometheus
 - `GET /healthz`
+- `POST /admin/simulate` — dry-run simulation (GFR_DRY_RUN=1)
+- `GET /v1/embeddings` — embedding request/response translation
 
 Optional headers: `x-gfr-tier: bulk|standard|scarce` (QoS preference), `Authorization: Bearer $GFR_TOKEN` (if `GFR_TOKEN` set).
 
 ## Config
 
-See `router.example.yaml`. Env overrides: `GFR_HOST`, `GFR_PORT`, `GFR_LEDGER`, `GFR_TOKEN`, `GFR_MAX_QUEUE_WAIT_S`, `GFR_LEARN=1` (auto-apply limits learned from 429 payloads).
+See `router.example.yaml`. Env overrides: `GFR_HOST`, `GFR_PORT`, `GFR_LEDGER`, `GFR_TOKEN`, `GFR_MAX_QUEUE_WAIT_S`, `GFR_LEARN=1` (auto-apply limits learned from 429 payloads), `GFR_BURN_CURVE=even|front-loaded`.
+
+Default burn curve: `even` — spreads RPD across the Pacific day so at most `ceil(elapsed/24h × rpd)` requests are allowed so far (prevents burst-then-recover). `front-loaded` has no pacing; full RPD available immediately.
 
 Default fleet (free-tier, captured 2026-10-12 — verify yours in AI Studio; last-verified dates matter):
 

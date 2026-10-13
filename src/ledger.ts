@@ -34,12 +34,14 @@ export class QuotaLedger {
   private states = new Map<string, ModelState>();
   private fleet: FleetModel[];
   private store: PersistStore;
+  private pacing: { burn_curve: "even" | "front-loaded" };
   private dirty = false;
   private flushTimer?: ReturnType<typeof setInterval>;
 
-  constructor(fleet: FleetModel[], store: PersistStore, flushEveryMs = 5_000) {
+  constructor(fleet: FleetModel[], store: PersistStore, flushEveryMs = 5_000, pacing: { burn_curve: "even" | "front-loaded" } = { burn_curve: "front-loaded" }) {
     this.fleet = fleet;
     this.store = store;
+    this.pacing = pacing;
     for (const m of fleet) {
       this.states.set(m.model, {
         rpm: [],
@@ -103,6 +105,16 @@ export class QuotaLedger {
     if (s.rpd >= lim.rpd) {
       s.doneForDay = true;
       return { ok: false, doneForDay: true, reason: "rpd-exhausted" };
+    }
+    // Burn curve: "even" spreads RPD across the PT day (stateless, time-based);
+    // "front-loaded" (default) allows bursting right up to the RPD limit.
+    if (this.pacing.burn_curve === "even") {
+      const elapsedMs = 86_400_000 - msUntilPtMidnight(new Date(now));
+      const allowed = Math.max(1, Math.ceil((elapsedMs / 86_400_000) * lim.rpd));
+      if (s.rpd >= allowed) {
+        const msForNext = (s.rpd * 86_400_000) / lim.rpd - elapsedMs;
+        return { ok: false, waitMs: Math.max(msForNext, 500), reason: "rpd-hourly-cap" };
+      }
     }
     const maxInFlight = Math.max(2, Math.floor(lim.rpm / 2));
     if (s.inFlight >= maxInFlight) {

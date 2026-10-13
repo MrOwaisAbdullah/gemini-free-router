@@ -1,0 +1,21 @@
+Large Language Model Systems Toolkit (llms.txt)
+===
+
+This project: Gemini Free-Tier Router v0.2
+An OpenAI-compatible proxy that runs on one Gemini API key and squeezes ~100% of the free tier out of it via per-model RPM/RPD/TPM scheduling, 429 forensics with self-learning, and quota-aware fallbacks.
+
+Features (v0.2):
+- OpenAI-compatible proxy (non-streaming + SSE streaming)
+- Quota ledger: RPM (60s sliding window), RPD (PT midnight Pacific reset), TPM (input tokens)
+- 429 forensics: classifies daily/minute/token-minute; self-learning `limit: N` from payloads
+- Fallback engine: re-ranked by remaining daily budget
+- 9-model free-tier fleet + 2 embedding models
+- `/v1/models`, `/v1/chat/completions`, `/healthz`, `/admin`, `/metrics`, `/admin/simulate`, `/v1/embeddings` endpoints
+- `x-gfr-tier` / `x-gfr-priority: hard` QoS headers
+- `GFR_DRY_RUN=1` flag for synthetic responses
+- Client-disconnect upstream abort (saves wasted TPM)
+- Burn-rate curve: `even` (hourly cap = ceil(rpd/24)) / `front-loaded` (no hourly cap)
+- TypeScript + Hono on Node 22 with node:sqlite WAL ledger
+
+Spec: SPEC.md
+Project: MrOwaisAbdullah/gemini-free-router

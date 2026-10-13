@@ -64,6 +64,9 @@ export function loadConfig(path?: string, env: NodeJS.ProcessEnv = process.env):
   if (env.GFR_LEDGER) cfg.ledger_path = env.GFR_LEDGER;
   if (env.GFR_TOKEN) cfg.auth = { token: env.GFR_TOKEN };
   if (env.GFR_MAX_QUEUE_WAIT_S) cfg.pacing.max_queue_wait_s = parseInt(env.GFR_MAX_QUEUE_WAIT_S, 10);
+  if (env.GFR_BURN_CURVE === "even" || env.GFR_BURN_CURVE === "front-loaded") {
+    cfg.pacing.burn_curve = env.GFR_BURN_CURVE;
+  }
   if (env.GFR_LEARN === "1" || env.GFR_LEARN === "true") cfg.learning.auto_apply = true;
   if (env.GFR_DRY_RUN === "1" || env.GFR_DRY_RUN === "true") cfg.dry_run = true;
   return cfg;

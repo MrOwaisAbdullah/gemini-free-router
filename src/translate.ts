@@ -1,3 +1,12 @@
+import type {
+  OpenAIChatRequest,
+  GeminiRequest,
+  GeminiContent,
+  ChatMessage,
+  OpenAIEmbeddingRequest,
+  GeminiResponse,
+} from "./types.ts";
+
 export interface EmbeddingUsage {
   promptTokenCount: number;
   totalTokenCount: number;
@@ -55,13 +64,13 @@ export function estimateInputTokens(req: OpenAIChatRequest): number {
 
 /** Gemini generateContent response → OpenAI chat.completion. */
 export function geminiToOpenAI(
-  g: { candidates?: { content?: { parts?: { text: string } }[] }; usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number } },
+  g: GeminiResponse,
   model: string,
   id = completionId(),
   created = Math.floor(Date.now() / 1000),
 ) {
   const u = g.usageMetadata ?? {};
-  const blocked = !!g.candidates?.[0]?.content?.parts?.[0]?.text
+  const blocked = g.candidates?.[0]?.content?.parts?.[0]?.text
     ? !!(g.candidates?.[0]?.finishReason && g.candidates?.[0]?.finishReason !== "STOP")
     : !!(g.promptFeedback?.blockReason);
   return {
@@ -87,7 +96,7 @@ export function geminiToOpenAI(
   };
 }
 
-function textOfGemini(g: { candidates?: { content?: { parts?: { text: string } }[] } }): string {
+function textOfGemini(g: GeminiResponse): string {
   const parts = g.candidates?.[0]?.content?.parts?.filter((p) => p.text) || [];
   return parts.map((p) => p.text).join("");
 }
@@ -98,7 +107,7 @@ export function completionId(): string {
 }
 
 /** Parse Gemini SSE (`data: {...}` lines) into response objects. */
-export function parseGeminiSseLine(line: string): { candidates?: { content?: { parts?: { text: string } }[] } } | null {
+export function parseGeminiSseLine(line: string): GeminiResponse | null {
   if (!line.startsWith("data:")) return null;
   const payload = line.slice(5).trim();
   if (!payload || payload === "[DONE]") return null;
@@ -111,7 +120,7 @@ export function parseGeminiSseLine(line: string): { candidates?: { content?: { p
 
 /** Build one OpenAI SSE chunk from a partial Gemini response. */
 export function geminiChunkToOpenAI(
-  g: { candidates?: { content?: { parts?: { text: string } }[] } },
+  g: GeminiResponse,
   model: string,
   id: string,
   created: number,
@@ -192,9 +201,9 @@ export function parseGeminiEmbeddingSseLine(line: string): {
   const payload = line.slice(5).trim();
   if (!payload || payload === "[DONE]") return null;
   try {
-    const parsed = JSON.parse(payload);
+    const parsed = JSON.parse(payload) as { data?: Array<{ embedding: number[]; index: number }> };
     return {
-      data: parsed.data?.map((d: any) => ({
+      data: parsed.data?.map((d) => ({
         embedding: d.embedding,
         index: d.index,
       })) || [],

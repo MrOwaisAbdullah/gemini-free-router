@@ -25,7 +25,7 @@ export async function acquire(
     }
   }
 
-  let last: ReserveResult = { ok: false, reason: "no-models" };
+  let last!: ReserveResult;
   for (;;) {
     if (opts.signal?.aborted) return null;
     const candidates = ledger.candidates(estTokens, opts.preferTier);

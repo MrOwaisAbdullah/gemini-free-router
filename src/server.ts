@@ -1,6 +1,7 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { stream } from "hono/streaming";
-import type { RouterConfig, OpenAIChatRequest } from "./types.ts";
+import type { RouterConfig, OpenAIChatRequest, OpenAIEmbeddingRequest } from "./types.ts";
 import { QuotaLedger } from "./ledger.ts";
 import { openStore } from "./storage.ts";
 import { classify429 } from "./forensics.ts";
@@ -14,6 +15,8 @@ import {
   sseFrame,
   openaiError,
   completionId,
+  openaiToGeminiEmbedding,
+  geminiToOpenAIEmbedding,
 } from "./translate.ts";
 
 export interface AppDeps {
@@ -36,7 +39,7 @@ export interface AppMetrics {
 export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metrics: AppMetrics } {
   const { cfg, apiKey } = deps;
   const fetchImpl = deps.fetchImpl ?? fetch;
-  const ledger = deps.ledger ?? new QuotaLedger(cfg.fleet, openStore(cfg.ledger_path));
+  const ledger = deps.ledger ?? new QuotaLedger(cfg.fleet, openStore(cfg.ledger_path), 5_000, cfg.pacing);
   const metrics: AppMetrics = {
     requests: 0,
     upstream429: 0,
@@ -45,6 +48,8 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     served: 0,
     rejected: 0,
   };
+  // Per-app 429 learn log (isolated between app instances / tests).
+  const learnLog: LearnLogEntry[] = [];
 
   const app = new Hono();
 
@@ -215,6 +220,7 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
           body,
           isStream,
           controller,
+          _retrySameModel: true,
         });
       }
       metrics.rejected += 1;
@@ -280,6 +286,8 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     const model = embeddingModels[0].model;
     const emb = openaiToGeminiEmbedding(body);
     const url = `${cfg.gemini.base_url}${emb.endpoint}`;
+    const controller = new AbortController();
+    onClientClose(c, () => controller.abort());
     try {
       const upstream = await fetchImpl(url, {
         method: "POST",
@@ -289,7 +297,10 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
       });
       if (!upstream.ok) {
         const text = await upstream.text().catch(() => "");
-        return c.json(openaiError(upstream.status, `upstream error: ${text.slice(0, 300)}`, "api_error"), upstream.status);
+        return c.json(
+          openaiError(upstream.status, `upstream error: ${text.slice(0, 300)}`, "api_error"),
+          upstream.status as 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503,
+        );
       }
       const json = await upstream.json() as { data: Array<{ embedding: number[]; index: number }>; usage: { promptTokenCount: number; totalTokenCount: number } };
       const openaiResp = geminiToOpenAIEmbedding(json, model);
@@ -350,14 +361,13 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     if (spec.hours <= 0 || spec.rps <= 0 || spec.avg_tokens <= 0) {
       return c.json(openaiError(400, "hours, rps, and avg_tokens must be positive", "invalid_request_error"), 400);
     }
-    const simLedger = new QuotaLedger(cfg.fleet, openStore(cfg.ledger_path + ".sim"), 0);
-    const now = Date.now();
+    const simLedger = new QuotaLedger(cfg.fleet, openStore(cfg.ledger_path + ".sim"), 0, cfg.pacing);
     let served = 0;
     let rejected = 0;
     const arrivalInterval = 1_000 / spec.rps;
     for (let i = 0; i < spec.hours * 3600 * spec.rps; i++) {
       await sleep(arrivalInterval);
-      const emb = {
+      const emb: OpenAIChatRequest = {
         model: "auto",
         messages: [{ role: "user", content: "hello" }],
         temperature: 0.2,
@@ -424,9 +434,7 @@ interface LearnLogEntry {
   modelName?: string;
 }
 
-let learnLog: LearnLogEntry[] = [];
-
-async function proxyUpstream(c: any, ctx: ProxyCtx): Promise<Response> {
+async function proxyUpstream(c: Context, ctx: ProxyCtx): Promise<Response> {
   const { cfg, ledger, metrics, modelName, est, body, isStream, controller } = ctx;
   // If we had a same-model retry request, fetch a fresh upstream.
   if (ctx._retrySameModel) {
@@ -457,7 +465,7 @@ async function proxyUpstream(c: any, ctx: ProxyCtx): Promise<Response> {
     }
     ctx.upstream = upstream;
   }
-  let upstream = ctx.upstream!;
+  const upstream = ctx.upstream!;
 
   if (!isStream) {
     const json = (await upstream.json()) as Parameters<typeof geminiToOpenAI>[0];
@@ -531,17 +539,6 @@ function onClientClose(c: { raw?: unknown; req?: { raw?: { signal?: AbortSignal 
     return;
   }
   c.req?.raw?.signal?.addEventListener?.("abort", cb);
-}
-
-function tierHint(h: string | undefined): string | undefined {
-  if (!h) return undefined;
-  const t = h.toLowerCase();
-  return t === "bulk" || t === "standard" || t === "scarce" ? t : undefined;
-}
-
-function reqToBody<T>(): T {
-  // Helper for type assertions
-  return {} as T;
 }
 
 export { sleep };

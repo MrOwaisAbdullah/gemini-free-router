@@ -63,6 +63,30 @@ export interface ChatMessage {
   content: string | Array<{ type: string; text?: string }> | null;
 }
 
+export interface GeminiContent {
+  role?: "user" | "model";
+  parts: Array<{ text: string }>;
+}
+
+export interface GeminiRequest {
+  contents: GeminiContent[];
+  systemInstruction?: { parts: Array<{ text: string }> };
+  generationConfig?: Record<string, unknown>;
+}
+
+export interface GeminiResponse {
+  candidates?: Array<{
+    content?: { parts?: Array<{ text: string }> };
+    finishReason?: string;
+  }>;
+  usageMetadata?: {
+    promptTokenCount?: number;
+    candidatesTokenCount?: number;
+    totalTokenCount?: number;
+  };
+  promptFeedback?: { blockReason?: string };
+}
+
 export interface QuotaSignal {
   kind: "daily" | "minute" | "token_minute" | "unknown";
   quotaId?: string;
