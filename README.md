@@ -138,6 +138,8 @@ The published package ships compiled JavaScript in `dist/` (Node refuses to stri
 TypeScript from files under `node_modules`); `npm pack`/`npm publish` build it
 automatically via the `prepack` script.
 
+**Package**: `npm i gemini-free-router` — version `0.2.0`, published to npmjs.com.
+
 429 classification is regression-tested against a golden fixture corpus in `test/fixtures/` (day, minute, token-minute, `retryDelay: 0s`, missing `details`, ambiguous) — when Google changes an error shape, drop the payload in there and add its expectations to `test/fixtures/429-corpus.json`.
 
 ## License
