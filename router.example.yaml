@@ -3,6 +3,22 @@ listen:
   host: 127.0.0.1
   port: 8787
 
+# --- Account plan (free | pro) ----------------------------------------------
+#   plan: free   (default) → built-in default limits are the free-tier
+#                            numbers captured from AI Studio
+#   plan: pro               → scales the built-in defaults x4 (Google's
+#                            published Pro-vs-free usage ratio). The 429
+#                            forensics learner (GFR_LEARN=1) then converges
+#                            to your project's real rpm/rpd/tpm from the
+#                            first quota response.
+#
+# Exact per-model Pro numbers live only in your account's console:
+#   aistudio.google.com/rate-limit
+# Copy them with fleet_mode: merge — explicit config numbers always win and
+# are never scaled. An explicit `fleet:` list in replace mode is likewise
+# taken as-is. Env GFR_PLAN=free|pro overrides this file.
+# plan: pro
+
 # --- Fleet maintenance -----------------------------------------------------
 # Models appear/deprecate and Google revises free-tier limits; maintain them
 # here without editing code:

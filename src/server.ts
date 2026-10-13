@@ -1,7 +1,8 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { stream } from "hono/streaming";
-import type { RouterConfig, OpenAIChatRequest, OpenAIEmbeddingRequest, FleetModel, GeminiResponse, QuotaSignal } from "./types.ts";
+import type { RouterConfig, OpenAIChatRequest, OpenAIEmbeddingRequest, FleetModel, GeminiResponse, QuotaSignal, ModelModality } from "./types.ts";
+import { matchesModality } from "./types.ts";
 import { QuotaLedger } from "./ledger.ts";
 import { openStore, MemoryStore } from "./storage.ts";
 import { classify429 } from "./forensics.ts";
@@ -20,6 +21,7 @@ import {
   completionId,
   openaiToGeminiEmbedding,
   geminiToOpenAIEmbedding,
+  type GeminiEmbeddingResponse,
 } from "./translate.ts";
 
 export interface AppDeps {
@@ -62,6 +64,17 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
   const note = (model: string, ok: boolean, latencyMs: number): void => {
     ledger.noteOutcome(model, ok, latencyMs);
     if (ok) ambiguous429.delete(model);
+  };
+
+  // Request cadence: every log line already carries `ts` (logger-stamped);
+  // `gap_ms` is the arrival gap since the previous request-bearing POST
+  // (chat/embeddings), -1 for the first request of the process.
+  let lastRequestAt = 0;
+  const markRequest = (): number => {
+    const now = Date.now();
+    const gap = lastRequestAt === 0 ? -1 : now - lastRequestAt;
+    lastRequestAt = now;
+    return gap;
   };
 
   /**
@@ -133,6 +146,7 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
 
   app.post("/v1/chat/completions", async (c) => {
     metrics.requests += 1;
+    const gapMs = markRequest();
     let body: OpenAIChatRequest;
     try {
       body = (await c.req.json()) as OpenAIChatRequest;
@@ -151,9 +165,16 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     const rejectExhausted = () => {
       metrics.rejected += 1;
       const resetMs = ledger.nextPtResetMs();
-      const waitSec = Math.min(Math.max(resetMs, 1000), 86_400_000);
-      c.header("retry-after", String(Math.ceil(waitSec / 1000)));
-      log.log("rejected", { reason: "fleet_exhausted", est, pt_reset_ms: resetMs }, "warn");
+      // Smallest wait until ANY model regains headroom (rpm/tpm window, burn
+      // curve, cooldown) — this is the real "rpm timer" the client should honor.
+      const windowWaitMs = ledger.minWaitMs(est);
+      const retryMs = windowWaitMs > 1_000 ? windowWaitMs : Math.min(Math.max(resetMs, 1000), 86_400_000);
+      c.header("retry-after", String(Math.ceil(retryMs / 1000)));
+      log.log(
+        "rejected",
+        { reason: "fleet_exhausted", est, pt_reset_ms: resetMs, window_wait_ms: windowWaitMs, gap_ms: gapMs },
+        "warn",
+      );
       return c.json(
         openaiError(
           429,
@@ -169,7 +190,7 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     // no reservation, no commit — the ledger stays untouched, so dry-run
     // traffic can never consume real free-tier budget.
     if (cfg.dry_run) {
-      const pick = pickModelReadonly(ledger, est, preferTier, resolveModel(body.model, cfg));
+      const pick = pickModelReadonly(ledger, est, preferTier, resolveModel(body.model, cfg, "chat"), "chat");
       if (!pick) return rejectExhausted();
       metrics.served += 1;
       c.header("x-gfr-dry-run", "1");
@@ -180,7 +201,8 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     const acq = await acquire(ledger, est, {
       maxWaitMs,
       preferTier,
-      preferredModel: resolveModel(body.model, cfg),
+      preferredModel: resolveModel(body.model, cfg, "chat"),
+      modality: "chat",
     });
 
     if (!acq || "waitExhausted" in acq) {
@@ -221,6 +243,25 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     }
     const upstreamLatencyMs = () => Date.now() - upstreamStart;
 
+    const baseCtx: ProxyCtx = {
+      cfg,
+      apiKey,
+      fetchImpl,
+      ledger,
+      metrics,
+      modelName,
+      est,
+      body,
+      isStream,
+      controller,
+      log,
+      note,
+      on429: handle429,
+      preferTier,
+      maxWaitMs,
+      gapMs,
+    };
+
     if (upstream.status === 429) {
       metrics.upstream429 += 1;
       let errBody: unknown = null;
@@ -235,31 +276,21 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
       const retry = await acquire(ledger, est, {
         maxWaitMs: Math.min(2_000, maxWaitMs),
         preferTier,
+        modality: "chat",
         signal: controller.signal,
       });
       if (retry && "pick" in retry) {
         return proxyUpstream(c, {
-          cfg,
-          apiKey,
-          fetchImpl,
-          ledger,
-          metrics,
+          ...baseCtx,
           modelName: retry.pick.model,
-          est,
-          body,
-          isStream,
-          controller,
           _retrySameModel: true,
-          log,
-          note,
-          on429: handle429,
         });
       }
       metrics.rejected += 1;
       c.header("retry-after", String(Math.ceil(signal.retryDelayMs / 1000)));
       log.log(
         "rejected",
-        { reason: "upstream_quota", model: modelName, kind: signal.kind, retry_delay_ms: signal.retryDelayMs },
+        { reason: "upstream_quota", model: modelName, kind: signal.kind, retry_delay_ms: signal.retryDelayMs, gap_ms: gapMs },
         "warn",
       );
       return c.json(
@@ -274,47 +305,21 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     }
 
     if (!upstream.ok) {
-      metrics.upstream5xx += 1;
       ledger.unreserve(modelName, est);
-      ledger.noteOutcome(modelName, false, upstreamLatencyMs());
-      let detail = "";
-      try {
-        detail = (await upstream.text()).slice(0, 500);
-      } catch {
-        /* ignore */
-      }
-      log.log(
-        "upstream_error",
-        { model: modelName, status: upstream.status, detail: detail.slice(0, 200) },
-        "error",
-      );
-      return c.json(
-        openaiError(upstream.status, `upstream error ${upstream.status}: ${detail}`, "api_error"),
-        upstream.status as 400 | 401 | 403 | 404 | 500 | 502 | 503,
-      );
+      const detail = await upstream.text().catch(() => "");
+      return failUpstream(c, baseCtx, modelName, upstream.status, detail, upstreamLatencyMs());
     }
 
     return proxyUpstream(c, {
-      cfg,
-      apiKey,
-      fetchImpl,
-      ledger,
-      metrics,
-      modelName,
-      est,
-      body,
-      isStream,
-      controller,
+      ...baseCtx,
       upstream,
       startedAt: upstreamStart,
-      log,
-      note,
-      on429: handle429,
     });
   });
 
   app.post("/v1/embeddings", async (c) => {
     metrics.requests += 1;
+    const gapMs = markRequest();
     let body: OpenAIEmbeddingRequest;
     try {
       body = (await c.req.json()) as OpenAIEmbeddingRequest;
@@ -329,25 +334,59 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
     if (embeddingModels.length === 0) {
       return c.json(openaiError(500, "no embedding models configured", "internal_error"), 500);
     }
-    // Use the first embedding model
-    const model = embeddingModels[0].model;
+    // Gemini's embed endpoints return no usageMetadata (live-verified) —
+    // estimate with the same floor/formula as the dry-run branch.
+    const embInputs = Array.isArray(body.input) ? body.input : [body.input];
+    const est = Math.max(16, Math.ceil(embInputs.join(" ").length / 4));
+    const maxWaitMs = Math.max(0, cfg.pacing.max_queue_wait_s) * 1000;
+
+    const rejectExhausted = () => {
+      metrics.rejected += 1;
+      const resetMs = ledger.nextPtResetMs();
+      const windowWaitMs = ledger.minWaitMs(est, Date.now(), "embeddings");
+      const retryMs = windowWaitMs > 1_000 ? windowWaitMs : Math.min(Math.max(resetMs, 1000), 86_400_000);
+      c.header("retry-after", String(Math.ceil(retryMs / 1000)));
+      log.log(
+        "rejected",
+        { reason: "fleet_exhausted", modality: "embeddings", est, pt_reset_ms: resetMs, window_wait_ms: windowWaitMs, gap_ms: gapMs },
+        "warn",
+      );
+      return c.json(
+        openaiError(
+          429,
+          `gemini-free-router: no embedding-model headroom; retry in ${Math.ceil(retryMs / 1000)}s`,
+          "rate_limit_error",
+          "free_tier_exhausted",
+        ),
+        429,
+      );
+    };
+
     // Dry run: synthetic vector, upstream never called (see chat handler).
     if (cfg.dry_run) {
+      const pick = pickModelReadonly(ledger, est, undefined, undefined, "embeddings");
+      if (!pick) return rejectExhausted();
       metrics.served += 1;
       c.header("x-gfr-dry-run", "1");
-      const inputs = Array.isArray(body.input) ? body.input : [body.input];
-      const promptTokens = Math.max(16, Math.ceil(inputs.join(" ").length / 4));
       return c.json({
         object: "list" as const,
-        data: inputs.map((_, i) => ({
+        data: embInputs.map((_, i) => ({
           object: "embedding" as const,
           index: i,
           embedding: new Array<number>(8).fill(0),
         })),
-        model,
-        usage: { promptTokenCount: promptTokens, totalTokenCount: promptTokens },
+        model: pick.model,
+        usage: { prompt_tokens: est, total_tokens: est },
       });
     }
+
+    // RPM/TPM/RPD gating: same acquire() path as chat — an rpm-window-full
+    // embedding model sits out until its minute window rolls (dev-log 1.19).
+    const acq = await acquire(ledger, est, { maxWaitMs, modality: "embeddings" });
+    if (!acq || "waitExhausted" in acq) {
+      return rejectExhausted();
+    }
+    const model = acq.pick.model;
     const emb = openaiToGeminiEmbedding(body);
     const url = `${cfg.gemini.base_url}${emb.endpoint}`;
     const controller = new AbortController();
@@ -362,23 +401,41 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
       });
       if (!upstream.ok) {
         const text = await upstream.text().catch(() => "");
+        ledger.unreserve(model, est);
+        if (upstream.status === 429) metrics.upstream429 += 1;
+        if (upstream.status >= 500) metrics.upstream5xx += 1;
         note(model, false, Date.now() - embStart);
-        log.log("upstream_error", { model, status: upstream.status, modality: "embeddings" }, "error");
+        // Dead/retired model → stop routing to it for the PT day (see failUpstream).
+        if (upstream.status === 404 && /no longer available|not found for api|unknown model/i.test(text)) {
+          ledger.markDoneForDay(model);
+          log.log(
+            "model_unavailable",
+            { model, action: "disabled_for_pt_day", modality: "embeddings", detail: text.slice(0, 200), gap_ms: gapMs },
+            "warn",
+          );
+        }
+        log.log(
+          "upstream_error",
+          { model, status: upstream.status, modality: "embeddings", detail: text.slice(0, 300), gap_ms: gapMs },
+          "error",
+        );
         return c.json(
           openaiError(upstream.status, `upstream error: ${text.slice(0, 300)}`, "api_error"),
           upstream.status as 400 | 401 | 403 | 404 | 429 | 500 | 502 | 503,
         );
       }
-      const json = await upstream.json() as { data: Array<{ embedding: number[]; index: number }>; usage: { promptTokenCount: number; totalTokenCount: number } };
-      const openaiResp = geminiToOpenAIEmbedding(json, model);
+      const json = (await upstream.json()) as GeminiEmbeddingResponse;
+      const openaiResp = geminiToOpenAIEmbedding(json, model, est);
+      ledger.commit(model, est, est);
       metrics.served += 1;
       note(model, true, Date.now() - embStart);
-      log.log("served", { model, latency_ms: Date.now() - embStart, modality: "embeddings" }, "debug");
+      log.log("served", { model, latency_ms: Date.now() - embStart, modality: "embeddings", gap_ms: gapMs }, "debug");
       return c.json(openaiResp);
     } catch (e) {
+      ledger.unreserve(model, est);
       metrics.rejected += 1;
       note(model, false, Date.now() - embStart);
-      log.log("upstream_error", { model, status: "fetch_failed", modality: "embeddings" }, "error");
+      log.log("upstream_error", { model, status: "fetch_failed", modality: "embeddings", detail: e instanceof Error ? e.message : String(e), gap_ms: gapMs }, "error");
       return c.json(openaiError(502, `upstream fetch failed: ${e instanceof Error ? e.message : String(e)}`, "api_error"), 502);
     }
   });
@@ -386,6 +443,8 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
   app.get("/admin", (c) => {
     const payload = {
       project: cfg.project,
+      plan: cfg.plan ?? "free",
+      fleet_mode: cfg.fleet_mode ?? "replace",
       fleet: ledger.snapshot(),
       metrics,
       learned: learnLog.slice(-50),
@@ -469,6 +528,7 @@ export function createApp(deps: AppDeps): { app: Hono; ledger: QuotaLedger; metr
       const acq = await acquire(simLedger, est, {
         maxWaitMs: 0, // virtual clock → never sleep in real time
         preferTier: undefined,
+        modality: "chat", // simulate chat traffic — never schedule onto embedding models
         now: simNow,
       });
       if (acq && "pick" in acq) {
@@ -505,11 +565,15 @@ function tierHint(h: string | undefined): string | undefined {
   return t === "bulk" || t === "standard" || t === "scarce" ? t : undefined;
 }
 
-function resolveModel(requested: string | undefined, cfg: RouterConfig): string | undefined {
+function resolveModel(
+  requested: string | undefined,
+  cfg: RouterConfig,
+  modality?: ModelModality,
+): string | undefined {
   if (!requested || requested === "auto" || requested === "gemini-free-router") return undefined;
-  const direct = cfg.fleet.find((m) => m.model === requested);
+  const direct = cfg.fleet.find((m) => m.model === requested && matchesModality(m, modality));
   if (direct) return direct.model;
-  const aliased = cfg.fleet.find((m) => m.alias === requested);
+  const aliased = cfg.fleet.find((m) => m.alias === requested && matchesModality(m, modality));
   return aliased?.model;
 }
 
@@ -525,8 +589,9 @@ function pickModelReadonly(
   est: number,
   preferTier: string | undefined,
   preferredModel: string | undefined,
+  modality?: ModelModality,
 ): FleetModel | undefined {
-  const candidates = ledger.candidates(est, preferTier);
+  const candidates = ledger.candidates(est, preferTier, undefined, modality);
   if (preferredModel) {
     const wanted = candidates.find((m) => m.model === preferredModel);
     if (wanted) return wanted;
@@ -609,6 +674,8 @@ function esc(s: unknown): string {
 /** Zero-dependency `/admin` dashboard (Accept: text/html). */
 function renderAdminHtml(p: {
   project: string;
+  plan: string;
+  fleet_mode: string;
   fleet: ReturnType<QuotaLedger["snapshot"]>;
   metrics: AppMetrics;
   learned: LearnLogEntry[];
@@ -669,7 +736,7 @@ function renderAdminHtml(p: {
 </head>
 <body>
 <h1>gemini-free-router — ${esc(p.project)}</h1>
-<div class="meta">PT reset in <b>${Math.round(p.pt_reset_ms / 60000)}m</b> · auto-refresh 30s · <a href="/admin">JSON</a> · <a href="/metrics">metrics</a></div>
+<div class="meta">plan <b>${p.plan}</b> · fleet_mode <b>${p.fleet_mode}</b> · PT reset in <b>${Math.round(p.pt_reset_ms / 60000)}m</b> · auto-refresh 30s · <a href="/admin">JSON</a> · <a href="/metrics">metrics</a></div>
 <h2>Router</h2>
 <div class="cards">
   <div class="card"><b>${m.requests}</b><span>requests</span></div>
@@ -711,6 +778,106 @@ interface ProxyCtx {
   note?: (model: string, ok: boolean, latencyMs: number) => void;
   /** classify + apply a 429 seen on the same-model retry path */
   on429?: (model: string, body: unknown, latencyMs: number) => QuotaSignal;
+  /** preferred tier for failover acquires (SPEC §7.4/§7.5 re-routes) */
+  preferTier?: string;
+  /** wait budget for failover acquires */
+  maxWaitMs: number;
+  /** 5xx failover position: 1 = original model, 2 = next model (SPEC §7.4) */
+  _5xxModelNo?: number;
+  /** set once the current model has consumed its 5xx same-model retry */
+  _5xxRetriedSame?: boolean;
+  /** arrival gap since the previous request-bearing POST (-1 for the first) */
+  gapMs?: number;
+}
+
+/** SPEC §7.4 bounds the 5xx chain to the original model + one next model. */
+const MAX_5XX_MODELS = 2;
+
+/**
+ * Non-429 upstream failure. For 5xx, SPEC §7.4 promises one same-model
+ * retry, then a hop to the next model (≤4 upstream calls total with the
+ * two-model bound); 4xx and exhausted failover pass through with the
+ * upstream status. Caller has already unreserved the attempt.
+ */
+async function failUpstream(
+  c: Context,
+  ctx: ProxyCtx,
+  modelName: string,
+  status: number,
+  detail: string,
+  latencyMs: number,
+): Promise<Response> {
+  const { ledger, metrics, log } = ctx;
+  const note = ctx.note ?? ((m: string, ok: boolean, l: number) => ledger.noteOutcome(m, ok, l));
+  if (status >= 500) metrics.upstream5xx += 1;
+  note(modelName, false, latencyMs);
+  log.log(
+    "upstream_error",
+    { model: modelName, status, detail: detail.slice(0, 200), gap_ms: ctx.gapMs },
+    "error",
+  );
+
+  // A 404 naming a dead/retired model must stop stealing ranking budget:
+  // an unconsumed quota keeps it top-ranked, so every queued request would
+  // keep landing on it (live-observed, §1.18). Disable it for the PT day.
+  if (status === 404 && /no longer available|not found for api|unknown model/i.test(detail)) {
+    ledger.markDoneForDay(modelName);
+    log.log(
+      "model_unavailable",
+      { model: modelName, action: "disabled_for_pt_day", detail: detail.slice(0, 200), gap_ms: ctx.gapMs },
+      "warn",
+    );
+  }
+
+  if (status >= 500) {
+    const modelNo = ctx._5xxModelNo ?? 1;
+    const child: ProxyCtx = {
+      cfg: ctx.cfg,
+      apiKey: ctx.apiKey,
+      fetchImpl: ctx.fetchImpl,
+      ledger: ctx.ledger,
+      metrics: ctx.metrics,
+      est: ctx.est,
+      body: ctx.body,
+      isStream: ctx.isStream,
+      controller: ctx.controller,
+      log: ctx.log,
+      note: ctx.note,
+      on429: ctx.on429,
+      preferTier: ctx.preferTier,
+      maxWaitMs: ctx.maxWaitMs,
+      gapMs: ctx.gapMs,
+      modelName,
+      _retrySameModel: true,
+      _5xxModelNo: modelNo,
+    };
+    if (!ctx._5xxRetriedSame) {
+      // One immediate same-model retry before giving up on this model.
+      // Best-effort reserve keeps the in-flight gauge honest on the retry.
+      ledger.reserve(modelName, ctx.est, Date.now());
+      child._5xxRetriedSame = true;
+      return proxyUpstream(c, child);
+    }
+    if (modelNo < MAX_5XX_MODELS) {
+      // Bounded hop to the *next* model — the failed one is excluded.
+      const next = await acquire(ledger, ctx.est, {
+        maxWaitMs: Math.min(2_000, ctx.maxWaitMs),
+        preferTier: ctx.preferTier,
+        modality: "chat",
+        exclude: [modelName],
+        signal: ctx.controller.signal,
+      });
+      if (next && "pick" in next) {
+        child.modelName = next.pick.model;
+        child._5xxModelNo = modelNo + 1;
+        child._5xxRetriedSame = false;
+        return proxyUpstream(c, child);
+      }
+    }
+  }
+
+  const code = status as 400 | 401 | 403 | 404 | 408 | 429 | 500 | 502 | 503 | 504;
+  return c.json(openaiError(status, `upstream error ${status}: ${detail.slice(0, 300)}`, "api_error"), code);
 }
 
 interface LearnLogEntry {
@@ -775,13 +942,8 @@ async function proxyUpstream(c: Context, ctx: ProxyCtx): Promise<Response> {
           429,
         );
       }
-      note(modelName, false, latency);
       const text = await upstream.text().catch(() => "");
-      log.log("upstream_error", { model: modelName, status: upstream.status }, "error");
-      return c.json(
-        openaiError(upstream.status, `upstream error: ${text.slice(0, 300)}`, "api_error"),
-        upstream.status as 429,
-      );
+      return failUpstream(c, ctx, modelName, upstream.status, text, latency);
     }
     ctx.upstream = upstream;
   }
@@ -793,7 +955,7 @@ async function proxyUpstream(c: Context, ctx: ProxyCtx): Promise<Response> {
     ledger.commit(modelName, est, usage);
     metrics.served += 1;
     note(modelName, true, Date.now() - startedAt);
-    log.log("served", { model: modelName, latency_ms: Date.now() - startedAt, stream: false }, "debug");
+    log.log("served", { model: modelName, latency_ms: Date.now() - startedAt, stream: false, gap_ms: ctx.gapMs }, "debug");
     return c.json(geminiToOpenAI(json, modelName));
   }
 
@@ -877,7 +1039,7 @@ async function proxyUpstream(c: Context, ctx: ProxyCtx): Promise<Response> {
         metrics.served += 1;
         note(modelName, !streamFailed, Date.now() - startedAt);
         if (!streamFailed) {
-          log.log("served", { model: modelName, latency_ms: Date.now() - startedAt, stream: true }, "debug");
+          log.log("served", { model: modelName, latency_ms: Date.now() - startedAt, stream: true, gap_ms: ctx.gapMs }, "debug");
         }
       }
       await out.close();

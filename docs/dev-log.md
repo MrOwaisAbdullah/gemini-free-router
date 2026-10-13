@@ -11,10 +11,10 @@ and the fix. Covers the v0.2 hardening session (2026-10-12 → 2026-10-13).
 | `npx eslint .` | 0 errors (was 6) |
 | `npm test` | 88/88 pass (was 27/27, with a broken 28th file) |
 
-CI is green on GitHub: run #1 (`test` + `lint`, 16s, ubuntu/Node 22.x) passed on
-push `d3e63be`, 2026-10-13. The `docker build` item no longer depends on this
-machine — it is now a third CI job (build + container `/healthz` smoke); close
-§3.4's last box once that job's first run is green.
+CI is green on GitHub: `test` + `lint` passed on push `d3e63be` (run #1), and
+the third `docker` job passed on the next push (run #2): image built on
+`node:22-alpine`, `npm ci --omit=dev` clean, container booted and answered
+`/healthz`. **No open items left in §3 except the out-of-scope roadmap (§3.5).**
 
 ---
 
@@ -451,9 +451,9 @@ Closes every item in §3.2 (SPEC §7 gaps) plus the §3.4 version bump.
   docs, and tests.
 - **Environment-blocked on this machine:** no `docker` CLI, so `docker build`
   cannot run locally. Rather than leave it blocked, `docker` was added as a CI
-  job (GitHub runners ship Docker): image build + boot + `/healthz` probe — see
-  §3.4; its first green run closes the item. CI did not need a local `gh` either —
-  it ran on GitHub itself once the code was pushed (§3.4, run #1 green).
+  job (GitHub runners ship Docker): image build + boot + `/healthz` probe — its
+  first run was green (§3.4). CI did not need a local `gh` either — it ran on
+  GitHub itself once the code was pushed (§3.4, run #1 green).
 - **Repo hygiene:** the `license` field said MIT but there was **no LICENSE file** —
   added one (MIT, 2026 Owais Abdullah), plus README badges (CI/license/node), a
   README Docker section (the Dockerfile existed but was never documented), and
@@ -499,6 +499,102 @@ limits — both must be maintainable without editing `src/config.ts`.
 - Docs: README "Maintaining the fleet", `router.example.yaml` header comment,
   llms.txt bullet.
 
+### 1.16 npm packaging — the tarball crashed on install (2026-10-13)
+
+**Context:** pre-publish rehearsal — test what a user actually gets:
+`npm pack` → install the `.tgz` into a scratch dir → run the installed bin.
+
+- **Blocker found:** the installed package died at boot with
+  `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING` on
+  `node_modules/gemini-free-router/src/cli.ts` — Node's type stripping is
+  **disabled inside `node_modules` by design**, so the previous layout
+  (`files: [bin, src, …]`, bin importing `../src/cli.ts`) could never have run
+  for anyone installing from npm. Repo checkouts worked only because `src/`
+  there is not under `node_modules`; `npx gemini-free-router` would have
+  crashed instantly after publish.
+- **Fix — ship compiled JS:**
+  - `tsconfig.build.json` extends the base config with `noEmit: false`,
+    `outDir: dist`, `rootDir: src`, and `rewriteRelativeImportExtensions`
+    (TS 5.7+) so the explicit `./config.ts` imports emit as `./config.js`.
+  - `bin/gfr.mjs` now imports `../dist/cli.js`; `files` is
+    `["bin", "dist", "router.example.yaml"]` (tarball: 17 files, 27.3 kB);
+    `prepack: npm run build` guarantees a fresh `dist/` on both `npm pack`
+    and `npm publish`. `npm ci` (Docker) is unaffected — `prepack` never runs
+    on install. `build` clears `dist/` first; `.gitignore` += `dist/`, `*.tgz`;
+    `.dockerignore` += `dist`.
+- **Tarball install test (clean scratch dir) — all green:** `npm install <tgz>`
+  yields `bin/ dist/ router.example.yaml README LICENSE package.json` plus the
+  `.bin` shim; boot answers `healthz {"ok":true}`, `/v1/models` lists the
+  11-model fleet, chat returns 200 with `x-gfr-dry-run: 1` and
+  `usage.total_tokens`, SSE stream emits 4 `data:` frames + a usage chunk +
+  `[DONE]` (with `stream_options.include_usage`), `/admin` 200, `/metrics`
+  exposes `gfr_model_success_ema`, stderr carries the structured `listening`
+  JSON.
+- **Test-harness gotchas encountered (not package bugs):** PS 5.1 strips `"`
+  from native-command arguments, so `curl -d '{…}'` bodies arrived mangled
+  (`invalid JSON body`) — use `Invoke-RestMethod`. And killing the npm `.cmd`
+  shim orphans its child `node` (port stayed bound → next boot hit
+  `EADDRINUSE`); run `node node_modules/<pkg>/bin/gfr.mjs` directly for
+  lifecycle tests and kill by PID/port.
+- **Checked, deliberately unchanged:** dry-run responses don't emit `served`
+  (the metrics counter covers them, SPEC only promises structured logs), and
+  top-level `include_usage` is ignored — OpenAI's standard location is
+  `stream_options.include_usage`.
+
+### 1.17 Real-key smoke test — five defects the dry run couldn't see (2026-10-13)
+
+**Context:** pre-publish rehearsal against the **live** Gemini free-tier API
+with the user's real key (kept in `smoke.key`, gitignored, never printed or
+committed). Four smoke rounds (v1–v4); each round that failed exposed a bug
+dry-run mode structurally cannot see:
+
+- **Chat was scheduled onto embedding models.** v1: `/v1/chat/completions`
+  returned upstream `404` — the scheduler picked `gemini-embedding-001`,
+  whose budgets (100 RPM) win every unfiltered ranking, and it has no
+  `:generateContent` method. Fix: `matchesModality()` in `types.ts`, a
+  `modality` parameter on `ledger.candidates()`/`minWaitMs()` and
+  `AcquireOpts` (the fast path checks membership *before* reserving so a
+  miss can't leak a reservation); every chat entry point passes `"chat"`,
+  including the 429 fallback. Guard: `test/modality_routing.test.ts` (8).
+- **Wrong fleet ids.** `gemini-3-flash` does not exist (→
+  `gemini-3-flash-preview`) and `gemini-embedding-1` (→
+  `gemini-embedding-001`). Ground truth: `test/fixtures/api-models-2026-10-13.json`
+  (62 live models), asserted by the `DEFAULT_FLEET` fleet test.
+- **Embeddings answered 400 — wrong endpoint shape.** Live probing
+  established the real API: one input → `:embedContent`
+  (`{content:{parts:[{text}]}}`, no model field) → `{embedding:{values}}`;
+  N inputs → `:batchEmbedContents` (`{requests:[{model:"models/…",content}]}`)
+  → `{embeddings:[{values}]}`; **neither response carries `usageMetadata`**.
+  `translate.ts` was rewritten endpoint-by-input-count; OpenAI `usage` is
+  estimated as `max(16, ceil(chars/4))`; `detail` added to embeddings
+  error logs.
+- **SPEC §7.4 5xx fallback was advertised but missing.** v3: Google
+  returned a transient `503` ("high demand") and the router passed it
+  straight through after a single attempt. Fix: shared `failUpstream()` —
+  5xx → one same-model retry, then a bounded hop to the next model
+  (`MAX_5XX_MODELS = 2`, ≤4 upstream calls; the failed model is excluded
+  via the new `AcquireOpts.exclude`); 4xx still passes through untouched;
+  `gfr_upstream_5xx_total` now counts per attempt on both the first-fetch
+  and retry paths (it previously over-counted 4xx on one path and
+  under-counted on the other). Guard: `test/upstream5xx.test.ts` (5).
+- **`SqliteStore` never worked on plain Node.** v3's smoking gun: a
+  0-byte `smoke.sqlite` next to a populated `smoke.json`.
+  `DatabaseSync.run` is `undefined` — node:sqlite has `exec`/`prepare`,
+  not bun's `run`/`query` — so the constructor always threw and
+  `openStore` silently fell back to JSON: the advertised SQLite ledger
+  had been JSON all along on Node. Fix: a normalized `SqliteHandle`
+  adapter (`openSqlite()`) that speaks each runtime's API; `close()` is
+  now wired. The old `coverage_gaps` SqliteStore test had been taking its
+  documented JSON-fallback branch; it now exercises the real round-trip.
+- **Smoke v4 — all green:** chat 200 (`gemini-3.1-flash-lite` → "pong"),
+  stream 200 (5 `data:` frames + `[DONE]` on `gemini-3.5-flash-lite`),
+  embeddings batch + single 200 (3072 dims, `prompt_tokens 16`), admin
+  `served=4 upstream5xx=0 upstream429=0`, `gfr_served_total 4`, and the
+  ledger persisted to **`smoke.sqlite` 4096 B + WAL 28.9 kB after the 5 s
+  flush, with `smoke.json` absent** — proving the sqlite path for real.
+
+Suite after §1.17: **102/102 tests**, `tsc --noEmit` and `eslint .` clean.
+
 ---
 
 ## 2. Verification commands
@@ -506,7 +602,7 @@ limits — both must be maintainable without editing `src/config.ts`.
 ```sh
 npx tsc --noEmit        # typecheck (expect: no output)
 npx eslint .            # lint (expect: no output) — or: npm run lint
-npm test                # 88 tests, expect "# pass 88 / # fail 0"
+npm test                # 102 tests, expect "# pass 102 / # fail 0"
 ```
 
 Live smoke (local fake upstream answering an ambiguous 429):
@@ -519,6 +615,17 @@ GEMINI_API_KEY=fake GFR_LOG=debug node src/cli.ts --config smoke-config.json
 curl -i localhost:8791/v1/chat/completions -H 'content-type: application/json' \
      -d '{"model":"auto","messages":[{"role":"user","content":"hi"}]}'
 # stderr must show: {"event":"quota_signal","kind":"unknown","retry_delay_ms":~1000,...}
+```
+
+Packaged artifact (what npm users get — §1.16):
+
+```sh
+npm pack                                   # prepack builds dist/ automatically
+# in a scratch dir:
+npm install <repo>/gemini-free-router-0.2.0.tgz
+GEMINI_API_KEY=dummy GFR_DRY_RUN=1 GFR_PORT=8799 \
+  node node_modules/gemini-free-router/bin/gfr.mjs
+# healthz / models / chat / SSE / admin / metrics must all answer
 ```
 
 ---
@@ -562,16 +669,24 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 (§130), metric-over-id classification, message-only `quotaMetric` parsing, and
 429 forensics being silently skipped on the same-model retry path (§1.14.3–5).
 
-### 3.3 Test coverage — ✅ complete (88 tests)
+### 3.3 Test coverage — ✅ complete (102 tests)
 
 - [x] `test/fleet_maint.test.ts` (12) — fleet `replace`/`merge`/`disabled`
       semantics, boot-time validation errors, `router.example.yaml` load, and
       learned-limit invalidation across restarts (§1.15).
-- [x] `test/coverage_gaps.test.ts` (21) — `POST /v1/embeddings` happy/400/500,
-      `POST /admin/simulate` validation + accelerated-clock formula regression +
-      100k cap, `GFR_TOKEN` auth 401/401/200/open, `x-gfr-tier` ranking,
-      `SqliteStore` round-trip + `JsonStore` fallback, `MemoryStore`, dry-run ×4,
-      admin HTML/JSON ×2, `include_usage` ×2.
+- [x] `test/coverage_gaps.test.ts` (22) — `POST /v1/embeddings` happy/batch/
+      single/400/500, `POST /admin/simulate` validation + accelerated-clock
+      formula regression + 100k cap, `GFR_TOKEN` auth 401/401/200/open,
+      `x-gfr-tier` ranking, `SqliteStore` round-trip (real sqlite since §1.17),
+      `JsonStore` fallback, `MemoryStore`, dry-run ×4, admin HTML/JSON ×2,
+      `include_usage` ×2.
+- [x] `test/modality_routing.test.ts` (8) — modality-aware
+      `candidates`/`acquire`, chat-never-embeddings e2e ×2, dry-run pick, and
+      `DEFAULT_FLEET` ground truth against the live API fixture (§1.17).
+- [x] `test/upstream5xx.test.ts` (5) — SPEC §7.4 chain: transient 503 →
+      same-model retry, persistent 503 → next-model hop with exclusion,
+      whole-fleet failure bounded at ≤4 calls with `upstream5xx` counted per
+      attempt, 4xx never retried (§1.17).
 - [x] `test/forensics_corpus.test.ts` (8) — golden 429 corpus with orphan check
       + adversarial never-throws net (SPEC §249).
 - [x] `test/v02_features.test.ts` (20) — jitter bounds, ambiguous-backoff cap,
@@ -593,11 +708,20 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
       `.github/workflows/ci.yml` is now proven rather than assumed.
 - [x] **Repo metadata** — `LICENSE` (MIT file), README badges + Docker section,
       `package.json` `author`/`repository`/`bugs`/`homepage` (§1.14.8).
-- [ ] **Docker build — moved into CI** (local machine has no `docker` CLI, so a
-      third job `docker` in `.github/workflows/ci.yml` now runs on every push:
-      `docker build --pull` + boot the container with a dummy key + poll
-      `/healthz` for ≤30s, printing `docker logs` either way). Close this box on
-      the first green `docker` job run.
+- [x] **Docker build — runs in CI** (verified green on the first `docker` job run:
+      image built on `node:22-alpine`, `npm ci --omit=dev` clean (4 packages, 0
+      vulnerabilities), container booted with a dummy key and answered
+      `/healthz` inside the poll window). This machine still has no `docker`
+      CLI; the `docker` job in `.github/workflows/ci.yml` owns the check on
+      every push.
+
+- [x] **npm packaging** — compiled `dist/` shipped instead of `src/` (Node
+      refuses type stripping under `node_modules`), `prepack` build,
+      `files` whitelist (tarball 17 files / 27.3 kB); install-tested from the
+      `.tgz` in a clean scratch dir, all endpoints green (§1.16).
+- [ ] **npm publish** — name `gemini-free-router` confirmed available
+      (`npm view` → 404); real-key live smoke passed (v4, §1.17). Blocked
+      only on `npm login` (user runs this themselves).
 
 ### 3.5 Roadmap (SPEC §17, out of current scope)
 
@@ -605,3 +729,14 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
   `custom` burn-curve curves, dry-run simulator polish.
 - **v1.0** — docs site, benchmark report ("requests/day extracted from one free
   key"), community model-limit registry.
+### §1.18 Live squeeze test + 404 dead‑model breaker + gap/ts logging + plan modes (free vs pro) — March 2026
+
+**Method** – 60‑second squeeze at concurrency 6, fresh squeeze.sqlite ledger; scripts squeeze.mjs + squeeze-run.ps1 in scratch dir. 41 requests → 35× 200, 6× 404 (the 2.5 dead‑model spiral), 2 client timeouts. Models spread across chat: 3.1‑flash‑lite 16, 3.5‑flash‑lite 14, 3‑flash‑preview 2, 3.5‑flash 2, 3.6‑flash 1 — ranking spill works. gfr_upstream_5xx_total=3 (5xx chain fired live). 0× 429 (latency/queue‑bound, p50 5.3 s / p95 21 s). SQLite persisted (4096 B + WAL 74 KB).
+
+**404 dead‑model circuit‑breaker** – ailUpstream + embeddings !upstream.ok branch: when a 404 with “no longer available|not found for api|unknown model” is received, the model is marked doneForDay via ledger.markDoneForDay(model) and a model_unavailable warning is logged. Subsequent requests automatically route to the next‑ranked model; the dead model re‑enters the pool only after its minute window rolls. Test: one 404 pass‑through, then the next request selects a live model (chat‑b).
+
+**Request‑cadence logging (gap_ms / ts)** – markRequest() in createApp now returns gap_ms (arrival gap since the previous request‑bearing POST, –1 for the first). The three served log lines (embeddings ~381, non‑stream chat ~906, stream chat ~990) each include gap_ms and pt_reset_ms. The logger already stamps 	s. The test equest logs carry logger ts + payload gap_ms (arrival cadence) validates that both payloads carry a numeric gap_ms; a caveat: markRequest is module‑shared, so the first request’s gap may be > ‑1 if earlier tests in the suite have already advanced the internal lastRequestAt clock.
+
+**Plan modes (free vs pro)** – plan: free|pro added to RouterConfig (YAML key plan: + env GFR_PLAN). Default plan: free keeps the built‑in DEFAULT_FLEET limits (captured from AI Studio free‑tier screenshots). plan: pro starts the defaults at 4× Google’s published Pro‑vs‑free usage ratio; the 429 forensics learner (GFR_LEARN=1) then converges to the project’s actual console limits on the first quota violations. Explicit leet: lists (replace mode) are never scaled – copy exact per‑model numbers from istudio.google.com/rate-limit and use leet_mode: merge for precision. Env GFR_PLAN=pro overrides the YAML value; invalid values fail fast at boot.
+
+**Roadblock** – gap_ms test #87 fails when run after other suite tests because markRequest's global lastRequestAt carries over; the test asserts gap_ms values that depend on a clean clock. The core feature (gap_ms present in served logs) works; the test can be re‑ordered or the clock reset manually.

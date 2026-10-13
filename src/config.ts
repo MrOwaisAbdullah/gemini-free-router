@@ -8,13 +8,13 @@ export const DEFAULT_FLEET: FleetModel[] = [
   { model: "gemini-3.5-flash-lite", rpm: 15, rpd: 500, tpm: 250_000, tier: "bulk" },
   { model: "gemini-2.5-flash-lite", rpm: 10, rpd: 20, tpm: 250_000, tier: "bulk" },
   { model: "gemini-2.5-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "standard" },
-  { model: "gemini-3-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "standard" },
+  { model: "gemini-3-flash-preview", rpm: 5, rpd: 20, tpm: 250_000, tier: "standard" },
   { model: "gemini-3.5-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "scarce" },
   { model: "gemini-3.6-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "scarce" },
   { model: "gemini-3.7-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "scarce" },
   { model: "gemini-3.8-flash", rpm: 5, rpd: 20, tpm: 250_000, tier: "scarce" },
   // Embeddings (SPEC §5: 100 RPM / 30K TPM / 1K RPD each)
-  { model: "gemini-embedding-1", rpm: 100, rpd: 1000, tpm: 30_000, tier: "bulk", modality: "embeddings", alias: "embed" },
+  { model: "gemini-embedding-001", rpm: 100, rpd: 1000, tpm: 30_000, tier: "bulk", modality: "embeddings", alias: "embed" },
   { model: "gemini-embedding-2", rpm: 100, rpd: 1000, tpm: 30_000, tier: "bulk", modality: "embeddings" },
 ];
 
@@ -27,6 +27,7 @@ export const DEFAULT_CONFIG: RouterConfig = {
   },
   fleet: DEFAULT_FLEET,
   fleet_mode: "replace",
+  plan: "free",
   disabled: [],
   pacing: { max_queue_wait_s: 30, burn_curve: "even", max_in_flight_per_model: "auto" },
   fallback: { strategy: "remaining-budget" },
@@ -55,6 +56,19 @@ function merge<T>(base: T, over: DeepPartial<T> | undefined): T {
 
 const FLEET_TIERS = new Set(["bulk", "standard", "scarce"]);
 const FLEET_MODALITIES = new Set(["chat", "embeddings"]);
+
+/**
+ * Google publishes AI Pro (consumer) at 4x the free tier's usage limits.
+ * The API-key project numbers live only in aistudio.google.com/rate-limit,
+ * so `plan: pro` starts the built-in defaults at 4x and lets the 429
+ * forensics learner (learning.auto_apply / manual applySignal) converge to
+ * the account's real rpm/rpd/tpm on the first quota response.
+ */
+export const PRO_PLAN_MULTIPLIER = 4;
+
+function scaleFleet(fleet: FleetModel[], mult: number): FleetModel[] {
+  return fleet.map((m) => ({ ...m, rpm: m.rpm * mult, rpd: m.rpd * mult, tpm: m.tpm * mult }));
+}
 
 /**
  * `fleet_mode: merge` — overlay config-file fleet entries onto the built-in
@@ -128,12 +142,27 @@ export function loadConfig(path?: string, env: NodeJS.ProcessEnv = process.env):
   }
   if (env.GFR_LEARN === "1" || env.GFR_LEARN === "true") cfg.learning.auto_apply = true;
   if (env.GFR_DRY_RUN === "1" || env.GFR_DRY_RUN === "true") cfg.dry_run = true;
+  if (env.GFR_PLAN !== undefined) {
+    if (env.GFR_PLAN !== "free" && env.GFR_PLAN !== "pro") {
+      throw new Error(`GFR_PLAN must be "free" or "pro" (got ${JSON.stringify(env.GFR_PLAN)})`);
+    }
+    cfg.plan = env.GFR_PLAN;
+  }
 
   // Fleet maintenance: resolve fleet_mode → apply disabled → validate.
+  if (cfg.plan !== "free" && cfg.plan !== "pro") {
+    throw new Error(`plan must be "free" or "pro" (got ${JSON.stringify(cfg.plan)})`);
+  }
   if (cfg.fleet_mode !== "replace" && cfg.fleet_mode !== "merge") {
     throw new Error(`fleet_mode must be "replace" or "merge" (got ${JSON.stringify(cfg.fleet_mode)})`);
   }
-  if (cfg.fleet_mode === "merge") cfg.fleet = mergeFleet(DEFAULT_CONFIG.fleet, cfg.fleet);
+  const hasFileFleet = Array.isArray(fileCfg.fleet) && fileCfg.fleet.length > 0;
+  if (cfg.fleet_mode === "merge") {
+    const base = cfg.plan === "pro" ? scaleFleet(DEFAULT_CONFIG.fleet, PRO_PLAN_MULTIPLIER) : DEFAULT_CONFIG.fleet;
+    cfg.fleet = mergeFleet(base, cfg.fleet);
+  } else if (cfg.plan === "pro" && !hasFileFleet) {
+    cfg.fleet = scaleFleet(cfg.fleet, PRO_PLAN_MULTIPLIER);
+  }
   const disabled = cfg.disabled ?? [];
   if (!Array.isArray(disabled) || disabled.some((d) => typeof d !== "string")) {
     throw new Error('disabled must be a list of model ids, e.g. disabled: ["gemini-2.5-flash-lite"]');

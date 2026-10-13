@@ -13,6 +13,21 @@ export interface FleetModel {
   alias?: string;
 }
 
+/**
+ * `modality` filter for candidate selection. `"chat"` matches every model that
+ * is not explicitly `embeddings` (modality defaults to chat); `"embeddings"`
+ * matches only embedding models; `undefined` matches everything.
+ *
+ * This guard is load-bearing: embedding models carry the fleet's largest
+ * budgets (100 RPM vs 5-15), so an unfiltered chat ranking would schedule
+ * chat traffic onto them first — a live-smoke finding (dev-log §1.17).
+ */
+export function matchesModality(m: FleetModel, modality?: ModelModality): boolean {
+  if (!modality) return true;
+  if (modality === "chat") return (m.modality ?? "chat") === "chat";
+  return m.modality === modality;
+}
+
 export interface RouterConfig {
   project: string;
   listen: { host: string; port: number };
@@ -29,6 +44,15 @@ export interface RouterConfig {
    * editing code.
    */
   fleet_mode?: "replace" | "merge";
+  /**
+   * Account plan behind the API key: "free" (default) or "pro".
+   * Only scales the BUILT-IN default fleet (free-tier screenshot limits are
+   * the 1x reference; pro starts at 4x Google's published Pro-vs-free ratio).
+   * Explicit config-file fleet numbers always win — copy your account's
+   * exact per-model limits from aistudio.google.com/rate-limit instead.
+   * The 429 forensics learner converges optimistic starts to real limits.
+   */
+  plan?: "free" | "pro";
   /** Model ids to drop from the fleet (deprecation), applied after fleet_mode. */
   disabled?: string[];
   pacing: PacingConfig;

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, DEFAULT_FLEET } from "../src/config.ts";
+import { loadConfig, DEFAULT_FLEET, PRO_PLAN_MULTIPLIER } from "../src/config.ts";
 import { QuotaLedger } from "../src/ledger.ts";
 import { MemoryStore } from "../src/storage.ts";
 import { ptDateKey } from "../src/time.ts";
@@ -140,4 +140,50 @@ test("legacy ledger file without a learnedCfg marker keeps learned limits", () =
   store.save({ day: ptDateKey(), models: { m1: { rpd: 5, rpdDay: ptDateKey(), learned: { rpd: 17 } } } });
   const l = new QuotaLedger(fleetOf(20), store, 0);
   assert.equal(l.snapshot()[0].effective.rpd, 17);
+});
+
+test("plan: default free keeps built-in limits; pro scales them x4 (env override)", () => {
+  const free = loadConfig(undefined, {});
+  assert.equal(free.plan, "free");
+  assert.equal(free.fleet[0].rpm, DEFAULT_FLEET[0].rpm);
+
+  const pro = loadConfig(undefined, { GFR_PLAN: "pro" });
+  assert.equal(pro.plan, "pro");
+  const base = DEFAULT_FLEET.find((m) => m.model === "gemini-3.1-flash-lite")!;
+  const scaled = pro.fleet.find((m) => m.model === "gemini-3.1-flash-lite")!;
+  assert.equal(scaled.rpm, base.rpm * PRO_PLAN_MULTIPLIER);
+  assert.equal(scaled.rpd, base.rpd * PRO_PLAN_MULTIPLIER);
+  assert.equal(scaled.tpm, base.tpm * PRO_PLAN_MULTIPLIER);
+  assert.equal(DEFAULT_FLEET[0].rpm, base.rpm, "defaults must not be mutated");
+
+  // env wins over the config file
+  const override = loadConfig(cfgFile("plan: pro\n"), { GFR_PLAN: "free" });
+  assert.equal(override.plan, "free");
+  assert.equal(override.fleet[0].rpm, DEFAULT_FLEET[0].rpm);
+});
+
+test("plan: pro + merge mode scales defaults, explicit config numbers win", () => {
+  const cfg = loadConfig(
+    cfgFile("plan: pro\nfleet_mode: merge\nfleet:\n  - { model: gemini-3.1-flash-lite, rpm: 7 }\n"),
+    {},
+  );
+  const patched = cfg.fleet.find((m) => m.model === "gemini-3.1-flash-lite")!;
+  assert.equal(patched.rpm, 7, "explicit rpm wins");
+  assert.equal(patched.rpd, DEFAULT_FLEET.find((m) => m.model === "gemini-3.1-flash-lite")!.rpd * 4, "untouched field scaled");
+  const other = cfg.fleet.find((m) => m.model === "gemini-3.5-flash")!;
+  assert.equal(other.rpm, 5 * 4, "untouched model scaled x4");
+});
+
+test("plan: pro never scales an explicit replace fleet; bad values fail fast", () => {
+  const cfg = loadConfig(
+    cfgFile("plan: pro\nfleet:\n  - { model: gemini-x, rpm: 5, rpd: 20, tpm: 1000, tier: bulk }\n"),
+    {},
+  );
+  assert.deepEqual(
+    [cfg.fleet[0].rpm, cfg.fleet[0].rpd, cfg.fleet[0].tpm],
+    [5, 20, 1000],
+    "replace-mode numbers are taken as-is",
+  );
+  assert.throws(() => loadConfig(cfgFile("plan: basic\n"), {}), /plan must be "free" or "pro"/);
+  assert.throws(() => loadConfig(undefined, { GFR_PLAN: "gold" }), /GFR_PLAN must be "free" or "pro"/);
 });
