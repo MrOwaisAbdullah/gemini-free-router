@@ -4,6 +4,15 @@
   "description": "Squeeze 100% out of Gemini's free tier - per-model RPM/RPD/TPM scheduling for a single API key",
   "type": "module",
   "license": "MIT",
+  "author": "Owais Abdullah",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrOwaisAbdullah/gemini-free-router.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MrOwaisAbdullah/gemini-free-router/issues"
+  },
+  "homepage": "https://github.com/MrOwaisAbdullah/gemini-free-router#readme",
   "bin": {
     "gemini-free-router": "./bin/gfr.mjs"
   },

@@ -21,6 +21,16 @@ export interface RouterConfig {
     api_key_env: string;
   };
   fleet: FleetModel[];
+  /**
+   * "replace" (default): a config file's `fleet` is the entire fleet.
+   * "merge": config entries merge onto the built-in defaults by model id —
+   * listed ids override just the fields given, unknown ids are appended,
+   * `disabled` then drops ids. Lets limits/models be maintained without
+   * editing code.
+   */
+  fleet_mode?: "replace" | "merge";
+  /** Model ids to drop from the fleet (deprecation), applied after fleet_mode. */
+  disabled?: string[];
   pacing: PacingConfig;
   fallback: { strategy: "remaining-budget" };
   learning: LearningConfig;

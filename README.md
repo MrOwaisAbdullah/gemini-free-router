@@ -1,5 +1,9 @@
 # gemini-free-router
 
+[![CI](https://github.com/MrOwaisAbdullah/gemini-free-router/actions/workflows/ci.yml/badge.svg)](https://github.com/MrOwaisAbdullah/gemini-free-router/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[![node](https://img.shields.io/badge/node-%3E%3D22.18-brightgreen.svg)](https://nodejs.org)
+
 **Squeeze 100% out of Gemini's free tier — per-model RPM/RPD/TPM scheduling for a single API key.**
 
 An OpenAI-compatible proxy that runs on **one Gemini API key / one Cloud project** and schedules its free-tier quotas preemptively — instead of bursting into a 429 and rotating keys. Google quotas are per **project**, not per key, so key rotation buys nothing; efficient scheduling is the only real lever.
@@ -26,6 +30,15 @@ print(client.chat.completions.create(
     messages=[{"role": "user", "content": "hi"}],
 ).choices[0].message.content)
 ```
+
+### Docker
+
+```bash
+docker build -t gemini-free-router .
+docker run -p 8787:8787 -e GEMINI_API_KEY=your-key gemini-free-router
+```
+
+The image runs the router on `0.0.0.0:8787` (that binding is baked in via `GFR_HOST`). CI builds the image and probes `/healthz` on every push, so a green build means the container boots.
 
 ## What it does
 
@@ -80,6 +93,29 @@ Default fleet (free-tier, captured 2026-10-12 — verify yours in AI Studio; las
 | gemini-2.5-flash-lite | 10 | 250K | 20 | bulk |
 | gemini-2.5/3/3.5/3.6/3.7/3.8-flash | 5 | 250K | 20 | standard/scarce |
 
+### Maintaining the fleet
+
+Models get released and deprecated, and Google revises free-tier limits — you maintain both in config, never in code:
+
+```yaml
+# router.yaml
+fleet_mode: merge            # overlay onto the built-in defaults
+disabled:                    # drop deprecated models by id
+  - gemini-2.5-flash-lite
+fleet:
+  - { model: gemini-2.5-flash, rpm: 8, rpd: 50 }                          # retune: override just what changed
+  - { model: gemini-4-flash, rpm: 5, rpd: 20, tpm: 250000, tier: scarce } # new model: unknown ids are appended
+```
+
+```bash
+gemini-free-router --config router.yaml
+```
+
+- **`replace` (default):** whatever you list under `fleet` *is* the whole fleet — configs that already do this keep behaving identically.
+- **`merge`:** built-in defaults stay; listed ids override only the fields they give, unknown ids are appended, `disabled` ids are removed.
+- The resolved fleet is **validated at boot** — a bad limit, unknown tier, duplicate id, or incomplete new model fails fast with a message naming the entry (a misconfigured fleet must not run).
+- **Learned limits never outlive a config edit:** values self-learned from 429 payloads normally override the configured numbers, but changing a model's `rpm`/`rpd`/`tpm` in config clears its stale learned values on restart — your new numbers take effect immediately.
+
 ## Safety posture
 
 - Binds to `127.0.0.1` by default.
@@ -99,4 +135,8 @@ npm start
 
 429 classification is regression-tested against a golden fixture corpus in `test/fixtures/` (day, minute, token-minute, `retryDelay: 0s`, missing `details`, ambiguous) — when Google changes an error shape, drop the payload in there and add its expectations to `test/fixtures/429-corpus.json`.
 
-Spec: see [SPEC.md](./SPEC.md). MIT.
+## License
+
+MIT — see [LICENSE](./LICENSE).
+
+ Spec: see [docs/SPEC.md](./docs/SPEC.md).

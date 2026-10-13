@@ -9,10 +9,12 @@ and the fix. Covers the v0.2 hardening session (2026-10-12 → 2026-10-13).
 |---|---|
 | `npx tsc --noEmit` | 0 errors (was 34) |
 | `npx eslint .` | 0 errors (was 6) |
-| `npm test` | 76/76 pass (was 27/27, with a broken 28th file) |
+| `npm test` | 88/88 pass (was 27/27, with a broken 28th file) |
 
-Still open: §3.4 git remote + `docker build` (both environment-blocked — no
-`gh`/`docker` CLI on this machine).
+CI is green on GitHub: run #1 (`test` + `lint`, 16s, ubuntu/Node 22.x) passed on
+push `d3e63be`, 2026-10-13. The `docker build` item no longer depends on this
+machine — it is now a third CI job (build + container `/healthz` smoke); close
+§3.4's last box once that job's first run is green.
 
 ---
 
@@ -447,15 +449,55 @@ Closes every item in §3.2 (SPEC §7 gaps) plus the §3.4 version bump.
   Node globals (rather than special-casing one file).
 - Added `.dockerignore` — the build context was shipping `node_modules`, `data/`,
   docs, and tests.
-- **Environment-blocked (not done):** there is no `docker` CLI on this machine, so
-  `docker build` still cannot be run here; there is no `gh` CLI and no git remote,
-  so CI has never executed on GitHub. Both stay open in §3.4.
+- **Environment-blocked on this machine:** no `docker` CLI, so `docker build`
+  cannot run locally. Rather than leave it blocked, `docker` was added as a CI
+  job (GitHub runners ship Docker): image build + boot + `/healthz` probe — see
+  §3.4; its first green run closes the item. CI did not need a local `gh` either —
+  it ran on GitHub itself once the code was pushed (§3.4, run #1 green).
+- **Repo hygiene:** the `license` field said MIT but there was **no LICENSE file** —
+  added one (MIT, 2026 Owais Abdullah), plus README badges (CI/license/node), a
+  README Docker section (the Dockerfile existed but was never documented), and
+  `package.json` `author`/`repository`/`bugs`/`homepage` fields.
 - **Live smoke test** (fake upstream answering an ambiguous 429 —
   `smoke-upstream.mjs` + `smoke-config.json`): banner on stdout; on stderr
   `{"event":"listening",…}`, `{"event":"quota_signal","kind":"unknown","retry_delay_ms":1092}`,
   and both `rejected` reasons; `/admin` HTML served with the quality column;
   `gfr_model_success_ema` exported; the second request correctly short-circuited
   to `fleet_exhausted` while the model was in backoff.
+
+### 1.15 Fleet maintainability — models & limits without code edits (2026-10-13)
+
+**Requirement:** models get released and deprecated, and Google revises free-tier
+limits — both must be maintainable without editing `src/config.ts`.
+
+- **Design — `fleet_mode` + `disabled` (`config.ts`):**
+  - `replace` (default): the config file's `fleet` *is* the whole fleet. The old
+    semantics were already "replace", and staying there was deliberate: flipping
+    the default to merge would have silently injected 11 default models into
+    existing single-model configs (like `smoke-config.json`), changing which
+    models absorb quota — the kind of quiet breakage that mis-schedules traffic.
+  - `merge`: config entries overlay `DEFAULT_FLEET` by model id — listed ids
+    override only the fields they provide, unknown ids (new models) are
+    appended, `disabled: [ids]` drops deprecated ones.
+- **Boot-time validation (`validateFleet`):** a misconfigured fleet must not
+  run — non-numeric or negative `rpm/rpd/tpm`, unknown `tier`/`modality`,
+  duplicate ids, an empty fleet (e.g. after disabling everything), and
+  incomplete appended models all throw with the model id in the message. A
+  `fleet_mode` typo (`mrege`) throws naming the allowed values instead of
+  silently running in replace mode.
+- **Learned limits vs config edits (`ledger.ts`):** `limits()` prefers values
+  self-learned from 429 payloads — which would let a *stale* learned value
+  shadow a user's config edit forever. `ModelState.learnedCfg` now records the
+  configured limits each learned value was derived against; `restore()` drops
+  learned values whose marker no longer matches the current config (your edit
+  wins on restart), and adopts the current config as the baseline for
+  pre-marker ledger files so their *next* edit invalidates them too.
+- **Tests (`test/fleet_maint.test.ts`, 12):** replace-mode regression, merge
+  override/append, `disabled` in both modes, empty-after-disabled, all five
+  validation errors, the shipped `router.example.yaml` staying loadable, and
+  three learned-vs-config restart scenarios (kept / invalidated / legacy file).
+- Docs: README "Maintaining the fleet", `router.example.yaml` header comment,
+  llms.txt bullet.
 
 ---
 
@@ -464,7 +506,7 @@ Closes every item in §3.2 (SPEC §7 gaps) plus the §3.4 version bump.
 ```sh
 npx tsc --noEmit        # typecheck (expect: no output)
 npx eslint .            # lint (expect: no output) — or: npm run lint
-npm test                # 76 tests, expect "# pass 76 / # fail 0"
+npm test                # 88 tests, expect "# pass 88 / # fail 0"
 ```
 
 Live smoke (local fake upstream answering an ambiguous 429):
@@ -520,14 +562,17 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 (§130), metric-over-id classification, message-only `quotaMetric` parsing, and
 429 forensics being silently skipped on the same-model retry path (§1.14.3–5).
 
-### 3.3 Test coverage — ✅ complete (76 tests)
+### 3.3 Test coverage — ✅ complete (88 tests)
 
+- [x] `test/fleet_maint.test.ts` (12) — fleet `replace`/`merge`/`disabled`
+      semantics, boot-time validation errors, `router.example.yaml` load, and
+      learned-limit invalidation across restarts (§1.15).
 - [x] `test/coverage_gaps.test.ts` (21) — `POST /v1/embeddings` happy/400/500,
       `POST /admin/simulate` validation + accelerated-clock formula regression +
       100k cap, `GFR_TOKEN` auth 401/401/200/open, `x-gfr-tier` ranking,
       `SqliteStore` round-trip + `JsonStore` fallback, `MemoryStore`, dry-run ×4,
       admin HTML/JSON ×2, `include_usage` ×2.
-- [x] `test/forensics_corpus.test.ts` (9) — golden 429 corpus with orphan check
+- [x] `test/forensics_corpus.test.ts` (8) — golden 429 corpus with orphan check
       + adversarial never-throws net (SPEC §249).
 - [x] `test/v02_features.test.ts` (20) — jitter bounds, ambiguous-backoff cap,
       logger levels/shape/cycle-safety/`GFR_LOG`, quality ranking ×4 + snapshot +
@@ -541,12 +586,18 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 
 - [x] `package.json` version bumped `0.1.0` → `0.2.0` (matches spec/README);
       `lint` script and `.dockerignore` added (§1.14.8).
-- [ ] **No git remote** — CI has never executed on GitHub. Blocked here: no `gh`
-      CLI and no remote configured. Create the repo, push `master`, confirm the
-      workflow (typecheck/test/lint) is green.
-- [ ] **Docker build untested** — blocked here: no `docker` CLI on this machine.
-      Dockerfile + `.dockerignore` are ready; run `docker build .` once Docker
-      (or a CI runner) is available.
+- [x] **Git remote + CI** — code pushed to
+      `github.com/MrOwaisAbdullah/gemini-free-router`; GitHub Actions run #1 on
+      `d3e63be` passed **both jobs** (`test` + `lint`, 16s total, ubuntu-latest /
+      Node 22.x), 2026-10-13. The workflow's first-ever execution was green, so
+      `.github/workflows/ci.yml` is now proven rather than assumed.
+- [x] **Repo metadata** — `LICENSE` (MIT file), README badges + Docker section,
+      `package.json` `author`/`repository`/`bugs`/`homepage` (§1.14.8).
+- [ ] **Docker build — moved into CI** (local machine has no `docker` CLI, so a
+      third job `docker` in `.github/workflows/ci.yml` now runs on every push:
+      `docker build --pull` + boot the container with a dummy key + poll
+      `/healthz` for ≤30s, printing `docker logs` either way). Close this box on
+      the first green `docker` job run.
 
 ### 3.5 Roadmap (SPEC §17, out of current scope)
 

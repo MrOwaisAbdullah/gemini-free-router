@@ -51,3 +51,31 @@ jobs:
 
       - name: Lint
         run: npx eslint .
+
+  # Runs where Docker is actually available (GitHub-hosted runners ship it),
+  # so the image gets built and booted on every push — this is the §3.4
+  # "docker build untested" check.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build --pull -t gemini-free-router:ci .
+
+      - name: Boot container and hit /healthz
+        run: |
+          docker run -d --name router -p 8787:8787 -e GEMINI_API_KEY=dummy gemini-free-router:ci
+          ok=""
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8787/healthz >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs router
+          if [ -z "$ok" ]; then
+            echo "::error::container never became healthy"
+            docker rm -f router
+            exit 1
+          fi
+          curl -sS http://127.0.0.1:8787/healthz
+          docker rm -f router

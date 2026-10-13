@@ -12,6 +12,9 @@ interface ModelState {
   inFlight: number;
   /** learned limits self-corrected from 429 `limit:` payloads */
   learned: { rpm?: number; rpd?: number; tpm?: number };
+  /** configured limits the learned values were derived against — if the user
+   *  edits the fleet, a mismatch invalidates stale learned values (config wins). */
+  learnedCfg?: { rpm: number; rpd: number; tpm: number };
   doneForDay: boolean;
   /** cool-down after a minute-throttle 429 (ms epoch) */
   coolUntil: number;
@@ -268,6 +271,8 @@ export class QuotaLedger {
       s.learned.rpm = lim;
       this.dirty = true;
     }
+    s.learnedCfg = { rpm: m.rpm, rpd: m.rpd, tpm: m.tpm };
+    this.dirty = true;
   }
 
   /** Models with headroom, ordered by remaining RPD desc, re-ranked by rolling quality (SPEC §7.4). */
@@ -349,7 +354,25 @@ export class QuotaLedger {
       s.rpd = typeof saved.rpd === "number" ? saved.rpd : 0;
       s.rpdDay = typeof saved.rpdDay === "string" ? saved.rpdDay : day;
       s.doneForDay = Boolean(saved.doneForDay);
-      s.learned = saved.learned ?? {};
+      // Learned limits only outrank the config while the config is unchanged:
+      // if the user edited this model's rpm/rpd/tpm since the values were
+      // learned, drop them so the new numbers take effect immediately.
+      const m = this.fleet.find((x) => x.model === k);
+      const cfgNow = m ? { rpm: m.rpm, rpd: m.rpd, tpm: m.tpm } : undefined;
+      const savedCfg = saved.learnedCfg;
+      const stale =
+        savedCfg &&
+        cfgNow &&
+        (savedCfg.rpm !== cfgNow.rpm || savedCfg.rpd !== cfgNow.rpd || savedCfg.tpm !== cfgNow.tpm);
+      if (stale) {
+        s.learned = {};
+        this.dirty = true;
+      } else {
+        s.learned = saved.learned ?? {};
+      }
+      // Pre-marker ledger files: adopt the current config as the baseline so
+      // the *next* config edit invalidates them too.
+      s.learnedCfg = cfgNow;
       const q = saved.quality;
       if (q && typeof q === "object" && typeof q.samples === "number" && q.samples > 0) {
         s.quality = {

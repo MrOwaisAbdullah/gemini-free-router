@@ -13,6 +13,7 @@ Features (v0.2):
 - Structured JSON logs on stderr (`GFR_LOG=debug|info|warn|error|off`) with a `quota_signal` event per parsed 429
 - Keep-alive connection pool toward Google (undici Agent; `GFR_POOL_CONNECTIONS` / `GFR_POOL_KEEPALIVE_MS`)
 - Golden 429 fixture corpus (`test/fixtures/429-corpus.json`) as the forensics regression net
+- Fleet maintenance without code edits: `fleet_mode: merge` (override limits / append new models by id), `disabled:` (drop deprecated models), boot-time fleet validation; 429-learned limits auto-clear when a model's configured limits change
 - 9-model free-tier fleet + 2 embedding models
 - `/v1/models`, `/v1/chat/completions`, `/healthz`, `/admin`, `/metrics`, `/admin/simulate`, `/v1/embeddings` endpoints
 - `x-gfr-tier: bulk|standard|scarce` QoS header
@@ -21,5 +22,5 @@ Features (v0.2):
 - Burn-rate curve: `even` (allows `max(1, ceil(elapsed/24h A- rpd))` so far) / `front-loaded` (no pacing)
 - TypeScript + Hono on Node 22 with node:sqlite WAL ledger
 
-Spec: SPEC.md
+ Spec: docs/SPEC.md
 Project: MrOwaisAbdullah/gemini-free-router

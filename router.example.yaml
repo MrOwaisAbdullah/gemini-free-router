@@ -2,6 +2,27 @@ project: single
 listen:
   host: 127.0.0.1
   port: 8787
+
+# --- Fleet maintenance -----------------------------------------------------
+# Models appear/deprecate and Google revises free-tier limits; maintain them
+# here without editing code:
+#
+#   fleet_mode: replace   (default) → the `fleet` list below IS the whole fleet
+#   fleet_mode: merge                → overlay onto the built-in defaults:
+#                                      listed ids override just the fields given,
+#                                      unknown ids are appended, `disabled` drops ids
+#
+# fleet_mode: merge
+# disabled:                                # drop deprecated models by id
+#   - gemini-2.5-flash-lite
+# fleet:
+#   - { model: gemini-2.5-flash, rpm: 8, rpd: 50 }                  # retune limits
+#   - { model: gemini-4-flash, rpm: 5, rpd: 20, tpm: 250000, tier: scarce }  # add a model
+#
+# Config is validated at boot; a typo fails fast with a clear error.
+# Limits learned from 429s (GFR_LEARN=1) auto-clear for any model whose
+# configured rpm/rpd/tpm you change — your edit always wins on restart.
+# -----------------------------------------------------------------------------
 fleet:
   - model: gemini-3.1-flash-lite
     rpm: 15

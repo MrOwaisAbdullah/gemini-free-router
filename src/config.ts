@@ -26,6 +26,8 @@ export const DEFAULT_CONFIG: RouterConfig = {
     api_key_env: "GEMINI_API_KEY",
   },
   fleet: DEFAULT_FLEET,
+  fleet_mode: "replace",
+  disabled: [],
   pacing: { max_queue_wait_s: 30, burn_curve: "even", max_in_flight_per_model: "auto" },
   fallback: { strategy: "remaining-budget" },
   learning: { auto_apply: false },
@@ -51,6 +53,63 @@ function merge<T>(base: T, over: DeepPartial<T> | undefined): T {
   return out as T;
 }
 
+const FLEET_TIERS = new Set(["bulk", "standard", "scarce"]);
+const FLEET_MODALITIES = new Set(["chat", "embeddings"]);
+
+/**
+ * `fleet_mode: merge` — overlay config-file fleet entries onto the built-in
+ * defaults by model id: listed ids override only the fields they provide,
+ * unknown ids (brand-new models) are appended.
+ */
+function mergeFleet(base: FleetModel[], patch: FleetModel[]): FleetModel[] {
+  const out = base.map((m) => ({ ...m }));
+  const byId = new Map(out.map((m) => [m.model, m]));
+  for (const p of patch) {
+    const cur = p && typeof p.model === "string" ? byId.get(p.model) : undefined;
+    if (!cur) {
+      out.push(p);
+      if (p && typeof p.model === "string") byId.set(p.model, p);
+      continue;
+    }
+    for (const [k, v] of Object.entries(p)) {
+      if (v === undefined || v === null) continue;
+      (cur as Record<string, unknown>)[k] = v;
+    }
+  }
+  return out;
+}
+
+/** Fail fast at boot with an actionable message — a typo'd fleet must not run. */
+function validateFleet(fleet: FleetModel[]): void {
+  if (!Array.isArray(fleet) || fleet.length === 0) {
+    throw new Error('fleet: no models configured (check the "fleet" and "disabled" entries in your config)');
+  }
+  const seen = new Set<string>();
+  fleet.forEach((m, i) => {
+    if (!m || typeof m !== "object" || typeof m.model !== "string" || !m.model.trim()) {
+      throw new Error(`fleet[${i}]: a non-empty "model" id is required`);
+    }
+    const label = `"${m.model}"`;
+    if (seen.has(m.model)) throw new Error(`fleet: duplicate model id ${label}`);
+    seen.add(m.model);
+    for (const key of ["rpm", "rpd", "tpm"] as const) {
+      const v = m[key];
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        throw new Error(`fleet entry ${label}: ${key} must be a number >= 0 (got ${JSON.stringify(v)})`);
+      }
+    }
+    if (!FLEET_TIERS.has(m.tier)) {
+      throw new Error(`fleet entry ${label}: tier must be bulk|standard|scarce (got ${JSON.stringify(m.tier)})`);
+    }
+    if (m.modality !== undefined && !FLEET_MODALITIES.has(m.modality)) {
+      throw new Error(`fleet entry ${label}: modality must be chat|embeddings (got ${JSON.stringify(m.modality)})`);
+    }
+    if (m.alias !== undefined && typeof m.alias !== "string") {
+      throw new Error(`fleet entry ${label}: alias must be a string`);
+    }
+  });
+}
+
 export function loadConfig(path?: string, env: NodeJS.ProcessEnv = process.env): RouterConfig {
   let fileCfg: DeepPartial<RouterConfig> = {};
   if (path && existsSync(path)) {
@@ -69,6 +128,21 @@ export function loadConfig(path?: string, env: NodeJS.ProcessEnv = process.env):
   }
   if (env.GFR_LEARN === "1" || env.GFR_LEARN === "true") cfg.learning.auto_apply = true;
   if (env.GFR_DRY_RUN === "1" || env.GFR_DRY_RUN === "true") cfg.dry_run = true;
+
+  // Fleet maintenance: resolve fleet_mode → apply disabled → validate.
+  if (cfg.fleet_mode !== "replace" && cfg.fleet_mode !== "merge") {
+    throw new Error(`fleet_mode must be "replace" or "merge" (got ${JSON.stringify(cfg.fleet_mode)})`);
+  }
+  if (cfg.fleet_mode === "merge") cfg.fleet = mergeFleet(DEFAULT_CONFIG.fleet, cfg.fleet);
+  const disabled = cfg.disabled ?? [];
+  if (!Array.isArray(disabled) || disabled.some((d) => typeof d !== "string")) {
+    throw new Error('disabled must be a list of model ids, e.g. disabled: ["gemini-2.5-flash-lite"]');
+  }
+  if (disabled.length) {
+    const drop = new Set(disabled);
+    cfg.fleet = cfg.fleet.filter((m) => m && !drop.has(m.model));
+  }
+  validateFleet(cfg.fleet);
   return cfg;
 }
 

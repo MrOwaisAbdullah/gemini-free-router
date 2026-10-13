@@ -16,5 +16,4 @@ smoke.ps1
 Dockerfile
 .dockerignore
 README.md
-SPEC.md
 llms.txt
