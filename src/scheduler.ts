@@ -1,4 +1,4 @@
-import type { FleetModel, ReserveResult } from "./types.ts";
+import type { FleetModel, ModelModality, ReserveResult } from "./types.ts";
 import type { QuotaLedger } from "./ledger.ts";
 import { jitter } from "./time.ts";
 
@@ -10,6 +10,17 @@ export interface AcquireOpts {
   maxWaitMs: number;
   preferTier?: string;
   preferredModel?: string;
+  /**
+   * Restrict scheduling to one modality (chat traffic must never land on an
+   * embedding model — they carry the fleet's largest budgets and would win
+   * every unfiltered ranking). Omit for "all models".
+   */
+  modality?: ModelModality;
+  /**
+   * Models the caller already tried (failed upstreams). A failover hop must
+   * never be handed the model it just failed on.
+   */
+  exclude?: readonly string[];
   signal?: AbortSignal;
   /**
    * Virtual clock (ms epoch). Omit for wall-clock behaviour. Used by
@@ -29,20 +40,26 @@ export async function acquire(
 ): Promise<{ pick: FleetModel; reserve: ReserveResult } | { waitExhausted: true; last: ReserveResult } | null> {
   const clock = (): number => opts.now ?? Date.now();
   const deadline = clock() + opts.maxWaitMs;
+  const excluded = new Set(opts.exclude ?? []);
 
-  // Fast path: preferred model if it has headroom.
+  // Fast path: preferred model if it has headroom. Membership is checked
+  // *before* reserving so a modality-filtered miss can't leak a reservation.
   if (opts.preferredModel) {
-    const r = ledger.reserve(opts.preferredModel, estTokens, clock());
-    if (r.ok) {
-      const m = ledger.candidates(estTokens, undefined, clock()).find((x) => x.model === opts.preferredModel);
-      if (m) return { pick: m, reserve: r };
+    const m = ledger
+      .candidates(estTokens, undefined, clock(), opts.modality)
+      .find((x) => x.model === opts.preferredModel && !excluded.has(x.model));
+    if (m) {
+      const r = ledger.reserve(opts.preferredModel, estTokens, clock());
+      if (r.ok) return { pick: m, reserve: r };
     }
   }
 
   let last!: ReserveResult;
   for (;;) {
     if (opts.signal?.aborted) return null;
-    const candidates = ledger.candidates(estTokens, opts.preferTier, clock());
+    const candidates = ledger
+      .candidates(estTokens, opts.preferTier, clock(), opts.modality)
+      .filter((x) => !excluded.has(x.model));
     if (candidates.length) {
       const r = ledger.reserve(candidates[0].model, estTokens, clock());
       if (r.ok) return { pick: candidates[0], reserve: r };
@@ -55,7 +72,7 @@ export async function acquire(
     // so N queued clients don't wake in lockstep and re-race). Never sleep
     // past the caller's deadline.
     const budget = deadline - clock();
-    const cap = Math.min(ledger.minWaitMs(estTokens, clock()) || 250, 250, budget);
+    const cap = Math.min(ledger.minWaitMs(estTokens, clock(), opts.modality) || 250, 250, budget);
     const waitMs = Math.min(jitter(cap), budget);
     if (waitMs <= 0) break;
     await sleep(waitMs, opts.signal);

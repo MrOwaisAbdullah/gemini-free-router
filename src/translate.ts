@@ -158,38 +158,57 @@ export function openaiError(status: number, message: string, type: string, code?
   };
 }
 
-/** OpenAI embeddings request → Gemini embedContent request. */
+/**
+ * OpenAI embeddings request → Gemini embed request.
+ * Live-verified against v1beta (dev-log §1.17):
+ *  - 1 input  → `:embedContent`, body `{content}` (no model field — adding one
+ *    is fine, but `requests` is rejected outright);
+ *  - n inputs → `:batchEmbedContents`, body `{requests:[{model:"models/…", content}]}`
+ *    — `model` is required on every request.
+ * The two endpoints accept each other's body shapes never; the old code sent
+ * `{requests:[…]}` to the singular endpoint and got a 400 for every call.
+ */
 export function openaiToGeminiEmbedding(req: OpenAIEmbeddingRequest): {
   endpoint: string;
   body: Record<string, unknown>;
 } {
   const model = req.model;
   const inputs = Array.isArray(req.input) ? req.input : [req.input];
-  const requests = inputs.map((text) => ({
-    content: { parts: [{ text }] },
-  }));
-  const body = { requests };
-  const endpoint = `/models/${model}:embedContent`;
-  return { endpoint, body };
+  if (inputs.length === 1) {
+    return {
+      endpoint: `/models/${model}:embedContent`,
+      body: { content: { parts: [{ text: inputs[0] }] } },
+    };
+  }
+  return {
+    endpoint: `/models/${model}:batchEmbedContents`,
+    body: {
+      requests: inputs.map((text) => ({
+        model: `models/${model}`,
+        content: { parts: [{ text }] },
+      })),
+    },
+  };
 }
 
-/** Gemini embedContent response → OpenAI embeddings response. */
-export function geminiToOpenAIEmbedding(
-  g: { data: Array<{ embedding: number[]; index: number } >; usage: { promptTokenCount: number; totalTokenCount: number } },
-  model: string,
-) {
-  const data = g.data.map((item) => ({
-    embedding: item.embedding,
-    index: item.index,
-  }));
+/** Real Gemini embedContent / batchEmbedContents response (verified live). */
+export interface GeminiEmbeddingResponse {
+  embedding?: { values: number[] };
+  embeddings?: Array<{ values: number[] }>;
+}
+
+/**
+ * → OpenAI embeddings response. Gemini returns no `usageMetadata` on either
+ * embed endpoint, so the caller passes its token estimate and we expose the
+ * OpenAI-compat `usage: {prompt_tokens, total_tokens}`.
+ */
+export function geminiToOpenAIEmbedding(g: GeminiEmbeddingResponse, model: string, promptTokens: number) {
+  const vectors = g.embedding ? [g.embedding.values] : (g.embeddings ?? []).map((e) => e.values);
   return {
     object: "list" as const,
-    data,
+    data: vectors.map((embedding, index) => ({ embedding, index })),
     model,
-    usage: {
-      promptTokenCount: g.usage.promptTokenCount,
-      totalTokenCount: g.usage.totalTokenCount,
-    },
+    usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
   };
 }
 

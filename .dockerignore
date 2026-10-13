@@ -17,3 +17,5 @@ Dockerfile
 .dockerignore
 README.md
 llms.txt
+dist
+gemini-tier

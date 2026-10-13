@@ -46,9 +46,56 @@ export class MemoryStore implements PersistStore {
   close(): void {}
 }
 
-interface SqliteDb {
-  run(sql: string, ...params: unknown[]): unknown;
-  query(sql: string): { get(...params: unknown[]): unknown };
+/**
+ * Normalized handle over the runtime's sqlite. bun:sqlite and node:sqlite
+ * expose different APIs (node:sqlite has no `db.run()` — bare statements go
+ * through `exec`, parameterised ones through `prepare().run()`), so the
+ * store only talks to this shape.
+ */
+interface SqliteHandle {
+  run(sql: string, ...params: unknown[]): void;
+  get(sql: string): unknown;
+  close(): void;
+}
+
+function openSqlite(path: string): SqliteHandle {
+  try {
+    const { Database } = req("bun:sqlite") as {
+      Database: new (p: string) => {
+        run(sql: string, ...params: unknown[]): unknown;
+        query(sql: string): { get(...params: unknown[]): unknown };
+        close(): void;
+      };
+    };
+    const db = new Database(path);
+    return {
+      run: (sql, ...params) => void db.run(sql, ...params),
+      get: (sql) => db.query(sql).get(),
+      close: () => db.close(),
+    };
+  } catch {
+    /* not Bun — try node:sqlite */
+  }
+  try {
+    const { DatabaseSync } = req("node:sqlite") as {
+      DatabaseSync: new (p: string) => {
+        exec(sql: string): void;
+        prepare(sql: string): { run(...params: unknown[]): unknown; get(): unknown };
+        close(): void;
+      };
+    };
+    const db = new DatabaseSync(path);
+    return {
+      run: (sql, ...params) => {
+        if (params.length === 0) db.exec(sql);
+        else db.prepare(sql).run(...params);
+      },
+      get: (sql) => db.prepare(sql).get(),
+      close: () => db.close(),
+    };
+  } catch {
+    throw new Error("no-sqlite-runtime");
+  }
 }
 
 /**
@@ -56,28 +103,17 @@ interface SqliteDb {
  * otherwise callers should fall back to JsonStore.
  */
 export class SqliteStore implements PersistStore {
-  private db: SqliteDb;
+  private db: SqliteHandle;
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
-    let DatabaseCtor: (new (p: string) => SqliteDb) | undefined;
-    try {
-      DatabaseCtor = req("bun:sqlite").Database;
-    } catch {
-      try {
-        DatabaseCtor = req("node:sqlite").DatabaseSync;
-      } catch {
-        throw new Error("no-sqlite-runtime");
-      }
-    }
-    if (!DatabaseCtor) throw new Error("no-sqlite-runtime");
-    this.db = new DatabaseCtor(path);
+    this.db = openSqlite(path);
     this.db.run("PRAGMA journal_mode = WAL");
     this.db.run("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)");
   }
 
   load(): Record<string, unknown> | null {
-    const row = this.db.query("SELECT v FROM kv WHERE k = 'ledger'").get() as { v: string } | undefined;
+    const row = this.db.get("SELECT v FROM kv WHERE k = 'ledger'") as { v: string } | undefined;
     if (!row) return null;
     try {
       return JSON.parse(row.v) as Record<string, unknown>;
@@ -93,7 +129,13 @@ export class SqliteStore implements PersistStore {
     );
   }
 
-  close(): void {}
+  close(): void {
+    try {
+      this.db.close();
+    } catch {
+      /* already closed */
+    }
+  }
 }
 
 /** Pick the best store for this runtime. */

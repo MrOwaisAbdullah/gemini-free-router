@@ -18,7 +18,7 @@ const CHAT_FLEET: FleetModel[] = [
 ];
 
 const EMB_FLEET: FleetModel[] = [
-  { model: "gemini-embedding-1", rpm: 100, rpd: 1000, tpm: 30_000, tier: "bulk", modality: "embeddings" },
+  { model: "gemini-embedding-001", rpm: 100, rpd: 1000, tpm: 30_000, tier: "bulk", modality: "embeddings" },
 ];
 
 function makeCfg(fleet: FleetModel[], extra: Partial<RouterConfig> = {}): RouterConfig {
@@ -74,11 +74,10 @@ test("embeddings: translates OpenAI request to Gemini embedContent and back", as
   const seen: string[] = [];
   const { app } = makeApp(cfg, async (url) => {
     seen.push(String(url));
+    // Real embedContent response shape (live-verified, dev-log §1.17):
+    // {embedding: {values}} — no data[], no usageMetadata.
     return new Response(
-      JSON.stringify({
-        data: [{ embedding: [0.1, 0.2, 0.3], index: 0 }],
-        usage: { promptTokenCount: 2, totalTokenCount: 2 },
-      }),
+      JSON.stringify({ embedding: { values: [0.1, 0.2, 0.3] } }),
       { status: 200 },
     );
   });
@@ -86,21 +85,61 @@ test("embeddings: translates OpenAI request to Gemini embedContent and back", as
     new Request("http://x/v1/embeddings", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "gemini-embedding-1", input: "hello world" }),
+      body: JSON.stringify({ model: "gemini-embedding-001", input: "hello world" }),
     }),
   );
   assert.equal(res.status, 200);
-  assert.ok(seen[0]?.includes("embedContent"), `upstream url: ${seen[0]}`);
+  assert.ok(seen[0]?.includes(":embedContent"), `upstream url: ${seen[0]}`);
+  assert.ok(!seen[0]?.includes("batch"), `single input must not batch: ${seen[0]}`);
   const json = (await res.json()) as {
     object: string;
     data: Array<{ embedding: number[] }>;
     model: string;
-    usage: { promptTokenCount: number };
+    usage: { prompt_tokens: number; total_tokens: number };
   };
   assert.equal(json.object, "list");
   assert.equal(json.data[0].embedding.length, 3);
-  assert.equal(json.model, "gemini-embedding-1");
-  assert.equal(json.usage.promptTokenCount, 2);
+  assert.equal(json.model, "gemini-embedding-001");
+  // Gemini returns no usageMetadata → router estimates max(16, ceil(chars/4));
+  // "hello world" is 11 chars → 16.
+  assert.equal(json.usage.prompt_tokens, 16);
+  assert.equal(json.usage.total_tokens, 16);
+});
+
+test("embeddings: multiple inputs → batchEmbedContents with model on each request", async () => {
+  const cfg = makeCfg(EMB_FLEET);
+  const seenUrls: string[] = [];
+  const seenBodies: Array<Record<string, unknown>> = [];
+  const { app } = makeApp(cfg, async (url, init) => {
+    seenUrls.push(String(url));
+    seenBodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return new Response(
+      JSON.stringify({ embeddings: [{ values: [0.1] }, { values: [0.2] }] }),
+      { status: 200 },
+    );
+  });
+  const res = await app.fetch(
+    new Request("http://x/v1/embeddings", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "gemini-embedding-001", input: ["alpha", "beta"] }),
+    }),
+  );
+  assert.equal(res.status, 200);
+  assert.ok(seenUrls[0]?.includes(":batchEmbedContents"), `upstream url: ${seenUrls[0]}`);
+  const reqs = seenBodies[0].requests as Array<{ model: string; content: { parts: Array<{ text: string }> } }>;
+  assert.equal(reqs.length, 2);
+  assert.equal(reqs[0].model, "models/gemini-embedding-001");
+  assert.equal(reqs[0].content.parts[0].text, "alpha");
+  assert.equal(reqs[1].content.parts[0].text, "beta");
+  const json = (await res.json()) as {
+    data: Array<{ embedding: number[]; index: number }>;
+    usage: { prompt_tokens: number };
+  };
+  assert.equal(json.data.length, 2);
+  assert.equal(json.data[1].index, 1);
+  assert.equal(json.data[1].embedding.length, 1);
+  assert.equal(json.usage.prompt_tokens, 16);
 });
 
 test("embeddings: missing input → 400 invalid_request_error", async () => {
@@ -425,7 +464,7 @@ test("dry-run: embeddings return a synthetic vector without calling upstream", a
     new Request("http://x/v1/embeddings", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ model: "gemini-embedding-1", input: ["alpha", "beta"] }),
+      body: JSON.stringify({ model: "gemini-embedding-001", input: ["alpha", "beta"] }),
     }),
   );
   assert.equal(res.status, 200);

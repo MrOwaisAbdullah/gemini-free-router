@@ -1,4 +1,5 @@
-import type { FleetModel, QuotaSignal, ReserveResult } from "./types.ts";
+import type { FleetModel, ModelModality, QuotaSignal, ReserveResult } from "./types.ts";
+import { matchesModality } from "./types.ts";
 import { jitter, msUntilPtMidnight, ptDateKey } from "./time.ts";
 import type { PersistStore } from "./storage.ts";
 
@@ -276,8 +277,10 @@ export class QuotaLedger {
   }
 
   /** Models with headroom, ordered by remaining RPD desc, re-ranked by rolling quality (SPEC §7.4). */
-  candidates(estTokens: number, preferTier?: string, now = Date.now()): FleetModel[] {
-    const eligible = this.fleet.filter((m) => this.canServe(m.model, estTokens, now).ok);
+  candidates(estTokens: number, preferTier?: string, now = Date.now(), modality?: ModelModality): FleetModel[] {
+    const eligible = this.fleet.filter(
+      (m) => matchesModality(m, modality) && this.canServe(m.model, estTokens, now).ok,
+    );
     const rank = (m: FleetModel) => {
       const s = this.model(m.model)!;
       const lim = this.limits(m, s);
@@ -293,9 +296,10 @@ export class QuotaLedger {
   }
 
   /** Smallest wait across the fleet before some model gains headroom. */
-  minWaitMs(estTokens: number, now = Date.now()): number {
+  minWaitMs(estTokens: number, now = Date.now(), modality?: ModelModality): number {
     let min = Number.POSITIVE_INFINITY;
     for (const m of this.fleet) {
+      if (!matchesModality(m, modality)) continue;
       const r = this.canServe(m.model, estTokens, now);
       if (r.ok) return 0;
       if (r.doneForDay) continue;

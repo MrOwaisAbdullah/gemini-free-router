@@ -4,3 +4,7 @@ data/
 *.db
 *.log
 .DS_Store
+dist/
+*.tgz
+gemini-tier/
+smoke.key
