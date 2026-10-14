@@ -14,7 +14,7 @@
   },
   "homepage": "https://github.com/MrOwaisAbdullah/gemini-free-router#readme",
   "bin": {
-    "gemini-free-router": "./bin/gfr.mjs"
+    "gemini-free-router": "bin/gfr.mjs"
   },
   "files": [
     "bin",
