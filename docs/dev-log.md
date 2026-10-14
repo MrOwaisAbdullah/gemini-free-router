@@ -758,3 +758,9 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 **Verification** — 4 new tests in `test/translate.test.ts` (data-URI → inline_data, remote URL → file_data with/without mime, system-role image, flat image-token estimate). Full suite 104/104 green; `tsc --noEmit` and `eslint .` clean. End-to-end against the real API through a running router on :8788 with `router.yaml`: a 1024×768 noisy JPEG as a `data:image/jpeg;base64,...` part → 200, accurate caption, `prompt_tokens: 1072` (actual replaced the 1100 estimate); an `https://…/3.jpg` part → 200, "Person with umbrella."
 
 **Version** — bumped 0.2.0 → 0.3.0 (new capability, backward compatible). Consumers that routed vision around the router (e.g. contentfte's `IMAGE_VLM_ENDPOINT`) can now point back at it.
+
+### §1.20 `npm pkg fix` — bin path normalization (metadata only) — 2026-10-15
+
+**Why** — publishing 0.3.0 emitted `npm warn bin[gemini-free-router] script name was cleaned`; npm wanted the `bin` entry normalized.
+
+**Fix** — ran `npm pkg fix` (the fix npm itself suggests). The whole diff is `"./bin/gfr.mjs"` → `"bin/gfr.mjs"`; the bin NAME (`gemini-free-router`) and version (0.3.0) are unchanged, and consumers that invoke the file by path (contentfte starts `node node_modules/gemini-free-router/bin/gfr.mjs`) are unaffected. Metadata-only, no src/test changes, so the 104/104 suite from the 0.3.0 publish still stands. Lands on the NEXT publish since 0.3.0 is immutable on the registry. Commit `958e868`.
