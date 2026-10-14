@@ -8,3 +8,5 @@ dist/
 *.tgz
 gemini-tier/
 smoke.key
+test-output*.txt
+test-run.txt

@@ -41,6 +41,83 @@ test("estimateInputTokens is positive and scales with content", () => {
   assert.ok(big > small);
 });
 
+// 1x1 transparent PNG as a base64 data URI (the exact shape OpenAI vision
+// clients send; lib/image_vision.py builds the same `data:<mime>;base64,...`).
+const PNG_1PX =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+const DATA_URI_PNG = `data:image/png;base64,${PNG_1PX}`;
+
+test("openaiToGemini translates image_url data URI to inline_data", () => {
+  const g = openaiToGemini({
+    model: "auto",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "describe" },
+          { type: "image_url", image_url: { url: DATA_URI_PNG } },
+        ],
+      },
+    ],
+  });
+  const parts = g.contents[0].parts;
+  assert.equal(parts.length, 2);
+  assert.equal(parts[0].text, "describe");
+  assert.deepEqual(parts[1].inline_data, { mime_type: "image/png", data: PNG_1PX });
+});
+
+test("openaiToGemini translates remote image URLs to file_data with mime from extension", () => {
+  const g = openaiToGemini({
+    model: "auto",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: "https://cdn.example.com/hero.jpg?w=800" } },
+          { type: "image_url", image_url: { url: "https://cdn.example.com/pic" } },
+        ],
+      },
+    ],
+  });
+  const parts = g.contents[0].parts;
+  assert.deepEqual(parts[0].file_data, { file_uri: "https://cdn.example.com/hero.jpg?w=800", mime_type: "image/jpeg" });
+  // no extension → file_data without mime_type (Gemini accepts it, live-verified)
+  assert.deepEqual(parts[1].file_data, { file_uri: "https://cdn.example.com/pic" });
+});
+
+test("image in system message lands in systemInstruction (Gemini-accepted)", () => {
+  const g = openaiToGemini({
+    model: "auto",
+    messages: [
+      { role: "system", content: [{ type: "image_url", image_url: { url: DATA_URI_PNG } }] },
+      { role: "user", content: "ok?" },
+    ],
+  });
+  assert.equal(g.systemInstruction?.parts.length, 1);
+  assert.equal(g.systemInstruction?.parts[0].inline_data?.mime_type, "image/png");
+});
+
+test("estimateInputTokens counts images at the measured flat ~1100 tokens", () => {
+  const textOnly = estimateInputTokens({ model: "m", messages: [{ role: "user", content: "hi" }] });
+  const withImage = estimateInputTokens({
+    model: "m",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "image_url", image_url: { url: DATA_URI_PNG } },
+        ],
+      },
+    ],
+  });
+  // Live-measured media tokens are ~1090 regardless of image size (512x512
+  // through 1536x1024), so the estimate must be flat, not byte-proportional —
+  // a 1.19MB image costs 1086 tokens, not the ~24K a bytes/4 math implies.
+  assert.ok(withImage - textOnly >= 1000, `image delta ${withImage - textOnly} should be ~1100`);
+  assert.ok(withImage - textOnly <= 1300, `image delta ${withImage - textOnly} should be ~1100`);
+});
+
 test("geminiToOpenAI maps usage and text", () => {
   const o = geminiToOpenAI(
     {

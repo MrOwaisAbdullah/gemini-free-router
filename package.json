@@ -1,6 +1,6 @@
 {
   "name": "gemini-free-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Squeeze 100% out of Gemini's free tier - per-model RPM/RPD/TPM scheduling for a single API key",
   "type": "module",
   "license": "MIT",

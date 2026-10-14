@@ -94,17 +94,33 @@ export interface OpenAIEmbeddingRequest {
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | Array<{ type: string; text?: string }> | null;
+  // OpenAI vision parts carry image_url; `detail` (low|high|auto) has no
+  // equivalent in generateContent and is ignored on translation.
+  content:
+    | string
+    | Array<{ type: string; text?: string; image_url?: { url?: string; detail?: string } }>
+    | null;
+}
+
+/**
+ * One Gemini request part. Exactly one field is set per part in practice
+ * (text XOR inline_data XOR file_data); all fields are optional so the
+ * text-only call sites keep reading `.text` without narrowing.
+ */
+export interface GeminiPart {
+  text?: string;
+  inline_data?: { mime_type: string; data: string };
+  file_data?: { file_uri: string; mime_type?: string };
 }
 
 export interface GeminiContent {
   role?: "user" | "model";
-  parts: Array<{ text: string }>;
+  parts: GeminiPart[];
 }
 
 export interface GeminiRequest {
   contents: GeminiContent[];
-  systemInstruction?: { parts: Array<{ text: string }> };
+  systemInstruction?: { parts: GeminiPart[] };
   generationConfig?: Record<string, unknown>;
 }
 

@@ -739,4 +739,22 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 
 **Plan modes (free vs pro)** – plan: free|pro added to RouterConfig (YAML key plan: + env GFR_PLAN). Default plan: free keeps the built‑in DEFAULT_FLEET limits (captured from AI Studio free‑tier screenshots). plan: pro starts the defaults at 4× Google’s published Pro‑vs‑free usage ratio; the 429 forensics learner (GFR_LEARN=1) then converges to the project’s actual console limits on the first quota violations. Explicit leet: lists (replace mode) are never scaled – copy exact per‑model numbers from istudio.google.com/rate-limit and use leet_mode: merge for precision. Env GFR_PLAN=pro overrides the YAML value; invalid values fail fast at boot.
 
-**Roadblock** – gap_ms test #87 fails when run after other suite tests because markRequest's global lastRequestAt carries over; the test asserts gap_ms values that depend on a clean clock. The core feature (gap_ms present in served logs) works; the test can be re‑ordered or the clock reset manually.
+**Roadblock** — gap_ms test #87 fails when run after other suite tests because markRequest's global lastRequestAt carries over; the test asserts gap_ms values that depend on a clean clock. The core feature (gap_ms present in served logs) works; the test can be re-ordered or the clock reset manually.
+
+### §1.19 Vision support — `image_url` → `inline_data`/`file_data` (v0.3.0) — 2026-10-14
+
+**Why** — the OpenAI-compat translator (`translate.ts`) only read `type === "text"` parts and silently dropped `image_url` parts. Any vision request through the router lost its image and the model answered from the text alone (a "silent wrong answer", worse than an error). Found while wiring the contentfte SEO Blog Agent, whose image-QA VLM (`lib/image_vision.py`) sends `data:<mime>;base64,...` parts.
+
+**Fix** — `geminiPartsOf()` translates each OpenAI content part: base64 data URIs → `{inline_data:{mime_type, data}}`; `http(s)://` and `gs://` URLs → `{file_data:{file_uri, mime_type?}}` (mime inferred from the path extension; absent extension → no `mime_type`, which Gemini accepts); unknown schemes pass through as `file_data` so Gemini's own validation error reaches the client instead of the image being dropped. `image_url.detail` has no generateContent equivalent and is ignored. Images are allowed in system messages too.
+
+**Live probes backing the design (all against `v1beta`, key from the project .env, 2026-10-14):**
+- `file_data` with an `https://` URI → 200 (real caption), so remote URLs work without downloading them into the proxy.
+- `inline_data` inside `systemInstruction` → 200, so system-role images are not rejected.
+- `file_data` with no `mime_type` → 200, so extension-less URLs don't need a forced mime.
+- **Media tokenization is flat, not byte-proportional** — measured `promptTokenCount` on `gemini-3.5-flash-lite` for noisy JPEGs: 512×512 (198 KB) = 1092, 768×512 (298 KB) = 1083, 1024×1024 (793 KB) = 1092, 1536×1024 (1.19 MB) = 1086. So `estimateImageTokens()` returns a flat ~1100/image. A bytes/4 heuristic would have estimated ~24K for the 1.19 MB image (22× over), falsely exhausting TPM windows and rejecting valid requests. The ledger still replaces the estimate with the actual `promptTokenCount` on commit (`server.ts` non-stream and stream paths).
+
+**Types** — `GeminiContent.parts` widened from `{text:string}[]` to `GeminiPart[]` (`{text?} | {inline_data?} | {file_data?}`); `ChatMessage.content` array items gained `image_url?: {url?, detail?}`. `GeminiPart` keeps all fields optional so existing text-only call sites (`.text` reads, `textOfGemini`) need no narrowing.
+
+**Verification** — 4 new tests in `test/translate.test.ts` (data-URI → inline_data, remote URL → file_data with/without mime, system-role image, flat image-token estimate). Full suite 104/104 green; `tsc --noEmit` and `eslint .` clean. End-to-end against the real API through a running router on :8788 with `router.yaml`: a 1024×768 noisy JPEG as a `data:image/jpeg;base64,...` part → 200, accurate caption, `prompt_tokens: 1072` (actual replaced the 1100 estimate); an `https://…/3.jpg` part → 200, "Person with umbrella."
+
+**Version** — bumped 0.2.0 → 0.3.0 (new capability, backward compatible). Consumers that routed vision around the router (e.g. contentfte's `IMAGE_VLM_ENDPOINT`) can now point back at it.

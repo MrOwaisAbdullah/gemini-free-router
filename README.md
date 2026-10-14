@@ -49,6 +49,7 @@ The image runs the router on `0.0.0.0:8787` (that binding is baked in via `GFR_H
 | **TPM** | Input-token sliding window — estimated pre-call, corrected with actual `promptTokenCount` post-call |
 | **429s** | Parsed via forensics (`quotaId` + `quotaMetric` + `RetryInfo` + `limit:` in the message; on conflict `quotaMetric` wins over `quotaId`). Daily exhaustion → model done-for-day; minute throttle → honor `retryDelay` exactly (0s → 5s floor); unclassifiable payloads → capped exponential backoff (1s–60s, jittered); learned limits self-correct the fleet table |
 | **Fallback** | Models re-ranked continuously by remaining daily budget **× rolling quality** (EMA of success rate and latency); exhausted models drop out for the day |
+| **Vision** | OpenAI `image_url` parts translate to Gemini `inline_data` (base64 data URIs) or `file_data` (http/https/gs URLs, mime inferred from extension). Measured media cost is ~1100 tokens/image regardless of size, so the pre-call estimate is flat per image and corrected with the actual `promptTokenCount` after the call |
 
 ## Endpoints
 

@@ -2,6 +2,7 @@ import type {
   OpenAIChatRequest,
   GeminiRequest,
   GeminiContent,
+  GeminiPart,
   ChatMessage,
   OpenAIEmbeddingRequest,
   GeminiResponse,
@@ -15,18 +16,17 @@ export interface EmbeddingUsage {
 /** OpenAI chat.completions request → Gemini generateContent request. */
 export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
   const contents: GeminiContent[] = [];
-  let systemInstruction: { parts: { text: string }[] } | undefined;
+  let systemParts: GeminiPart[] | undefined;
 
   for (const msg of req.messages ?? []) {
-    const t = textOf(msg.content);
+    const parts = geminiPartsOf(msg.content);
     if (msg.role === "system") {
-      systemInstruction = systemInstruction
-        ? { parts: [...systemInstruction.parts, { text: t }] }
-        : { parts: [{ text: t }] };
+      // Live-verified: Gemini accepts inline_data inside systemInstruction.
+      systemParts = systemParts ? [...systemParts, ...parts] : parts;
     } else if (msg.role === "assistant") {
-      contents.push({ role: "model", parts: [{ text: t }] });
+      contents.push({ role: "model", parts });
     } else {
-      contents.push({ role: "user", parts: [{ text: t }] });
+      contents.push({ role: "user", parts });
     }
   }
 
@@ -37,29 +37,95 @@ export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
   if (req.stop) generationConfig.stopSequences = Array.isArray(req.stop) ? req.stop : [req.stop];
 
   const out: GeminiRequest = { contents };
-  if (systemInstruction) out.systemInstruction = systemInstruction;
+  if (systemParts) out.systemInstruction = { parts: systemParts };
   if (Object.keys(generationConfig).length) out.generationConfig = generationConfig;
   return out;
 }
 
-function textOf(content: ChatMessage["content"]): string {
-  if (content == null) return "";
-  if (typeof content === "string") return content;
-  return content
-    .filter((p) => p.type === "text" && typeof p.text === "string")
-    .map((p) => p.text)
-    .join("");
+/** OpenAI content (string | parts array) → Gemini parts, images included. */
+function geminiPartsOf(content: ChatMessage["content"]): GeminiPart[] {
+  if (content == null) return [{ text: "" }];
+  if (typeof content === "string") return [{ text: content }];
+  const parts: GeminiPart[] = [];
+  for (const p of content) {
+    if (p.type === "image_url") {
+      const url = p.image_url?.url;
+      if (url) parts.push(imagePartOf(url));
+    } else if (typeof p.text === "string") {
+      parts.push({ text: p.text });
+    }
+  }
+  return parts.length ? parts : [{ text: "" }];
 }
 
-/** Cheap pre-call input-token estimate (chars/4 + per-message overhead). */
+const DATA_URI = /^data:([^;,]*)((?:;[^,]*)?),([\s\S]*)$/;
+
+function imagePartOf(url: string): GeminiPart {
+  const m = DATA_URI.exec(url);
+  if (m && /;base64/i.test(m[2] ?? "")) {
+    const mime = m[1] && m[1].includes("/") ? m[1] : "application/octet-stream";
+    return { inline_data: { mime_type: mime, data: m[3] } };
+  }
+  if (/^(https?|gs):\/\//i.test(url)) {
+    const mime = mimeFromUrl(url);
+    return mime ? { file_data: { file_uri: url, mime_type: mime } } : { file_data: { file_uri: url } };
+  }
+  // Unknown scheme (incl. non-base64 data URIs): pass through as file_data so
+  // Gemini's own validation error reaches the client instead of the image
+  // being silently dropped.
+  return { file_data: { file_uri: url } };
+}
+
+const EXT_MIME: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  heic: "image/heic",
+  heif: "image/heif",
+  bmp: "image/bmp",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+};
+
+function mimeFromUrl(url: string): string | undefined {
+  const path = url.split(/[?#]/)[0];
+  const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
+  return EXT_MIME[ext];
+}
+
+function estimateImageTokens(): number {
+  // Measured live on gemini-3.5-flash-lite (2026-10-14): media tokenization is
+  // ~flat for standard sizes — 512x512=1092, 768x512=1083, 1024x1024=1092,
+  // 1536x1024=1086 prompt tokens, independent of byte size (198KB..1.19MB).
+  // So a flat per-image estimate beats any byte/dimension heuristic; the
+  // ledger still replaces it with the actual promptTokenCount on success.
+  return 1100;
+}
+
+/** Cheap pre-call input-token estimate (text chars/4 + images + per-message overhead). */
 export function estimateInputTokens(req: OpenAIChatRequest): number {
   let chars = 0;
+  let imageTokens = 0;
   let messages = 0;
   for (const msg of req.messages ?? []) {
-    chars += textOf(msg.content).length;
     messages += 1;
+    const content = msg.content;
+    if (content == null) continue;
+    if (typeof content === "string") {
+      chars += content.length;
+      continue;
+    }
+    for (const p of content) {
+      if (p.type === "image_url") {
+        if (p.image_url?.url) imageTokens += estimateImageTokens();
+      } else if (typeof p.text === "string") {
+        chars += p.text.length;
+      }
+    }
   }
-  return Math.max(16, Math.ceil(chars / 4) + messages * 4);
+  return Math.max(16, Math.ceil(chars / 4) + imageTokens + messages * 4);
 }
 
 /** Gemini generateContent response → OpenAI chat.completion. */
