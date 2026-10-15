@@ -88,7 +88,14 @@ export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
     if (t?.type !== "function" || !t.function?.name) continue;
     const d: GeminiFunctionDeclaration = { name: t.function.name };
     if (t.function.description) d.description = t.function.description;
-    if (t.function.parameters) d.parameters = t.function.parameters;
+    if (t.function.parameters) {
+      const p = t.function.parameters;
+      // Pydantic/strict-mode SDKs hang definitions off the root — refs
+      // (#/$defs/Name) resolve against them during conversion.
+      const defs = ((p.$defs ?? p.definitions) ?? {}) as Record<string, unknown>;
+      const schema = geminiSchema(p, defs);
+      if (schema) d.parameters = schema;
+    }
     declarations.push(d);
   }
   // tool_choice "none" = the model must not call anything: omitting the
@@ -99,6 +106,108 @@ export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
     if (toolConfig) out.toolConfig = toolConfig;
   }
   return out;
+}
+
+/**
+ * OpenAI/JSON-Schema parameters → Gemini's Schema. Gemini's Schema is a
+ * strict OpenAPI-3.0 subset: an unknown keyword anywhere is a hard upstream
+ * 400 (`Unknown name "additionalProperties" at
+ * tools[0].function_declarations[0].parameters` — live, contentfte CI
+ * 2026-10-15, from agno/Pydantic strict-mode schemas). Whitelist instead of
+ * blacklist so no future dialect keyword can 400 a call again, and normalize
+ * the constructs Pydantic emits: local $defs/$ref inlined, `type:
+ * ["x","null"]` and anyOf/oneOf null-entries → `nullable`, single-survivor
+ * anyOf/oneOf merged into the parent. Unsupported validation niceties
+ * (format, additionalProperties, allOf, $schema, …) are dropped — tool
+ * arguments care about usability, not full JSON-Schema fidelity.
+ */
+const GEMINI_SCHEMA_KEYS = new Set([
+  "type", "title", "description", "nullable", "enum", "items", "properties",
+  "required", "minimum", "maximum", "minLength", "maxLength", "pattern",
+  "minItems", "maxItems", "minProperties", "maxProperties", "default",
+  "anyOf", "propertyOrdering",
+]);
+
+function geminiSchema(
+  raw: unknown,
+  defs: Record<string, unknown>,
+  depth = 0,
+): Record<string, unknown> | undefined {
+  if (depth > 8) return undefined; // self-referential $ref cycles
+  let node = raw;
+  for (let hop = 0; hop < 4; hop++) {
+    const ref = (node && typeof node === "object" ? (node as Record<string, unknown>).$ref : undefined);
+    if (typeof ref !== "string") break;
+    node = defs[ref.split("/").pop() ?? ""];
+  }
+  if (!node || typeof node !== "object" || Array.isArray(node)) return undefined;
+  const src = node as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+
+  let nullable = src.nullable === true;
+
+  let types: string[] = [];
+  if (typeof src.type === "string") types = [src.type];
+  else if (Array.isArray(src.type)) types = src.type.filter((t): t is string => typeof t === "string");
+  if (types.includes("null")) {
+    nullable = true;
+    types = types.filter((t) => t !== "null");
+  }
+  if (types.length) out.type = types[0]; // non-null unions collapse (leniency)
+
+  const variants = Array.isArray(src.anyOf)
+    ? src.anyOf
+    : Array.isArray(src.oneOf)
+      ? src.oneOf
+      : [];
+  const mapped: Record<string, unknown>[] = [];
+  for (const v of variants) {
+    const isNullish = !!v && typeof v === "object" && (v as Record<string, unknown>).type === "null";
+    if (isNullish) {
+      nullable = true;
+      continue;
+    }
+    const m = geminiSchema(v, defs, depth + 1);
+    if (m) mapped.push(m);
+  }
+  if (mapped.length === 1) {
+    for (const [k, val] of Object.entries(mapped[0])) {
+      if (k !== "nullable") out[k] = val;
+      else if (val === true) nullable = true;
+    }
+  } else if (mapped.length > 1) {
+    out.anyOf = mapped;
+  }
+
+  if (nullable) out.nullable = true;
+
+  for (const key of GEMINI_SCHEMA_KEYS) {
+    if (key === "type" || key === "anyOf" || key === "nullable") continue;
+    const val = src[key];
+    if (val == null) continue;
+    if (key === "properties") {
+      if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+      const props: Record<string, unknown> = {};
+      for (const [pname, pval] of Object.entries(val as Record<string, unknown>)) {
+        const m = geminiSchema(pval, defs, depth + 1);
+        if (m) props[pname] = m;
+      }
+      if (Object.keys(props).length) out.properties = props;
+      continue;
+    }
+    if (key === "items") {
+      const m = geminiSchema(val, defs, depth + 1);
+      if (m) out.items = m;
+      continue;
+    }
+    if (key === "default") {
+      const t = typeof val;
+      if (t === "string" || t === "number" || t === "boolean") out.default = val;
+      continue;
+    }
+    out[key] = val; // enum + primitive keywords pass through verbatim
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /** OpenAI tool_call.arguments (a JSON string) → the object Gemini expects. */

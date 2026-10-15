@@ -323,6 +323,67 @@ test("chunk mapping carries functionCall deltas with index and finish tool_calls
   assert.deepEqual(JSON.parse(choice.delta.tool_calls![0].function.arguments), { x: 1 });
 });
 
+test("strict-mode/Pydantic parameter schemas sanitize to Gemini's Schema subset", () => {
+  // Live-proven failure (contentfte CI 2026-10-15): agno/Pydantic sends
+  // strict-mode JSON Schema; Gemini 400s on any unknown keyword
+  // ("Unknown name additionalProperties ... Cannot find field").
+  const g = openaiToGemini({
+    model: "auto",
+    messages: [{ role: "user", content: "x" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "get_keyword_tool",
+          description: "Read/write access to ContentSpark_Keywords worksheet",
+          parameters: {
+            type: "object",
+            title: "get_keyword_toolArgs",
+            additionalProperties: false,
+            $schema: "http://json-schema.org/draft-07/schema#",
+            properties: {
+              action: { type: "string" },
+              worksheet_name: { anyOf: [{ type: "string" }, { type: "null" }] },
+              status: { $ref: "#/$defs/Status" },
+              rows: { type: "array", items: { $ref: "#/$defs/Row" } },
+            },
+            required: ["action"],
+            $defs: {
+              Status: { type: ["string", "null"], enum: ["available", "used"] },
+              Row: {
+                type: "object",
+                properties: { name: { type: "string" } },
+                additionalProperties: false,
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+  const decls = g.tools?.[0].functionDeclarations;
+  const params = decls?.[0].parameters ?? {};
+  assert.equal(params.additionalProperties, undefined);
+  assert.equal(params.$schema, undefined);
+  assert.equal(params.$defs, undefined);
+  assert.equal(params.title, "get_keyword_toolArgs");
+  assert.deepEqual(params.required, ["action"]);
+  const props = params.properties as Record<string, Record<string, unknown>>;
+  // anyOf [string, null] -> nullable string
+  assert.equal(props.worksheet_name.type, "string");
+  assert.equal(props.worksheet_name.nullable, true);
+  assert.equal(props.worksheet_name.anyOf, undefined);
+  // $ref into $defs, type array form -> nullable + inlined enum
+  assert.equal(props.status.type, "string");
+  assert.equal(props.status.nullable, true);
+  assert.deepEqual(props.status.enum, ["available", "used"]);
+  // nested $ref inside array items, unknown keyword stripped at depth
+  const rows = props.rows.items as Record<string, Record<string, unknown>>;
+  assert.equal(rows.type, "object");
+  assert.equal(rows.additionalProperties, undefined);
+  assert.equal((rows.properties as Record<string, unknown>).name !== undefined, true);
+});
+
 test("Gemini thoughtSignature + call id round-trip on the client's echo (Gemini 3)", () => {
   // Gemini 3 responds with {functionCall:{...,id}, thoughtSignature} and 400s
   // a replay missing the signature — the router memoizes its own generated
