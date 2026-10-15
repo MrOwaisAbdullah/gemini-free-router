@@ -1,26 +1,31 @@
 Large Language Model Systems Toolkit (llms.txt)
 ===
 
-This project: Gemini Free-Tier Router v0.2
+This project: Gemini Free-Tier Router v0.4.1
 An OpenAI-compatible proxy that runs on one Gemini API key and squeezes ~100% of the free tier out of it via per-model RPM/RPD/TPM scheduling, 429 forensics with self-learning, and quota-aware fallbacks.
 
-Features (v0.2):
-- OpenAI-compatible proxy (non-streaming + SSE streaming)
-- Quota ledger: RPM (60s sliding window), RPD (PT midnight Pacific reset), TPM (input tokens)
+Features (v0.4.1):
+- OpenAI-compatible proxy (non-streaming + SSE streaming); point clients at http://127.0.0.1:8787/v1 — model auto, a fleet model id, or an alias (fast, embed)
+- Quota ledger: RPM (60s sliding window), RPD (Pacific-midnight reset), TPM (input tokens); node:sqlite WAL ledger, flushed on SIGTERM
 - 429 forensics: classifies daily/minute/token-minute from quotaMetric (wins over quotaId) + RetryInfo + `limit:` text; self-learning `limit: N`; unclassifiable payloads get a capped, jittered 1s-60s backoff
-- Fallback engine: re-ranked by remaining daily budget × rolling quality (EMA of success rate + latency)
+- Fallback engine: re-ranked by remaining daily budget × rolling quality (EMA of success rate and latency); transient 5xx → same-model retry then bounded next-model hop; 404 dead-model circuit breaker
+- Plan modes: plan: free|pro (env GFR_PLAN); pro scales built-in defaults ×4; the learner converges to your console's real limits
+- Fleet maintenance without code edits: fleet_mode replace|merge (merge overlays/appends onto the built-in defaults), disabled:, aliases, boot-time validation; 429-learned limits auto-clear when a model's configured limits change
+- Built-in fleet: 9 chat models + 2 embedding models (gemini-3.1-flash-lite alias fast; gemini-embedding-001 alias embed), limits captured 2026-10-12
+- Vision (v0.3.0): OpenAI image_url → Gemini inline_data (base64 data URIs) / file_data (http(s)/gs URLs); flat ~1100-token/image estimate corrected with the actual promptTokenCount
+- Function calling (v0.4.0): tools/tool_choice ⇄ functionDeclarations/toolConfig; tool_calls ⇄ functionCall/functionResponse both directions incl. SSE deltas; Gemini 3 thoughtSignature memoized per tool_call id
+- Strict-schema sanitizer (v0.4.1): whitelist converter maps Pydantic/agno JSON Schema (additionalProperties, $schema, $defs/$ref, anyOf-null Optionals, type arrays) to Gemini's Schema subset
+- Embeddings: /v1/embeddings ⇄ embedContent / batchEmbedContents
+- QoS x-gfr-tier: bulk|standard|scarce header; GFR_TOKEN bearer auth (401 on mismatch); GFR_DRY_RUN=1 synthetic responses (x-gfr-dry-run: 1, no upstream call, no quota)
+- Endpoints: /v1/models, /v1/chat/completions, /v1/embeddings, /healthz, /admin (JSON; HTML dashboard with Accept: text/html), /metrics (Prometheus), /admin/simulate (virtual-clock what-if on a throwaway ledger, 100k cap)
+- Structured JSON logs on stderr (GFR_LOG=debug|info|warn|error|off) with a quota_signal event per parsed 429
+- Keep-alive connection pool toward Google (undici Agent; GFR_POOL_CONNECTIONS / GFR_POOL_KEEPALIVE_MS / GFR_POOL_CONNECT_MS); client-disconnect upstream abort
 - Jittered router-owned timers (queue polls, ledger flush, backoff); Google's retryDelay is honored exactly
-- Structured JSON logs on stderr (`GFR_LOG=debug|info|warn|error|off`) with a `quota_signal` event per parsed 429
-- Keep-alive connection pool toward Google (undici Agent; `GFR_POOL_CONNECTIONS` / `GFR_POOL_KEEPALIVE_MS`)
-- Golden 429 fixture corpus (`test/fixtures/429-corpus.json`) as the forensics regression net
-- Fleet maintenance without code edits: `fleet_mode: merge` (override limits / append new models by id), `disabled:` (drop deprecated models), boot-time fleet validation; 429-learned limits auto-clear when a model's configured limits change
-- 9-model free-tier fleet + 2 embedding models
-- `/v1/models`, `/v1/chat/completions`, `/healthz`, `/admin`, `/metrics`, `/admin/simulate`, `/v1/embeddings` endpoints
-- `x-gfr-tier: bulk|standard|scarce` QoS header
-- `GFR_DRY_RUN=1` flag for synthetic responses (no upstream call, no quota spent; response carries `x-gfr-dry-run: 1`)
-- Client-disconnect upstream abort (saves wasted TPM)
-- Burn-rate curve: `even` (allows `max(1, ceil(elapsed/24h A- rpd))` so far) / `front-loaded` (no pacing)
-- TypeScript + Hono on Node 22 with node:sqlite WAL ledger
+- Burn-rate curve: even (allows max(1, ceil(elapsed/24h × rpd)) so far) / front-loaded (no pacing)
+- Golden 429 fixture corpus (test/fixtures/429-corpus.json) as the forensics regression net
+- TypeScript + Hono on Node 22
 
- Spec: docs/SPEC.md
+Skill: skills/gemini-router/SKILL.md (agent integration recipe: install, config, client wiring, version floors, CI quota persistence)
+Spec: docs/SPEC.md
+Dev log: docs/dev-log.md
 Project: MrOwaisAbdullah/gemini-free-router
