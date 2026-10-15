@@ -788,3 +788,15 @@ Also closed while implementing the above: ambiguous-429 exponential backoff
 **Verification** — 1 new test in `test/translate.test.ts` (agno-dialect schema: additionalProperties/$schema stripped at root and at depth, $ref-into-$defs inlined with enum kept, anyOf-null and type-array forms → nullable). Suite 113/113, `tsc --noEmit` and `eslint .` clean. Live: the round-trip re-run with the exact strict-mode dialect (`additionalProperties: false`, `title`, anyOf-null `worksheet_name`, `$defs` enum, `default: null`) — read → `update_row` → final text `AI social media tools for agencies` → `ROUNDTRIP_OK`.
 
 **Version** — 0.4.0 → 0.4.1 (bugfix on the new function-calling path; no API change). contentfte's `^0.4.0` already admits it — a lock refresh (`npm install`) is enough.
+
+### 1.23 Agent integration skill — `skills/gemini-router/` + agent docs refreshed to v0.4.1 — 2026-10-15
+
+**Why** — every capability above (0.3.0 vision, 0.4.0 function calling, 0.4.1 schema sanitizer) was learned from the consumer side: the contentfte SEO Blog Agent hit the silent image drop, the empty-tool-call 200s, and the strict-schema 400 in production before they were fixed here. But the repo's agent-facing entry points still described v0.2 — `llms.txt` had no vision/tools/sanitizer and the README still said "version 0.2.0" — so an agent integrating from these docs would have wired a router that silently drops images and tool calls.
+
+**What** —
+- New `skills/gemini-router/` (`SKILL.md` + `references/config.md` + `references/ops-and-ci.md`), mirrored from the copy created in the contentfte repo (this becomes the canonical home). `SKILL.md` leads with the version-floor table (≥0.3.0 vision / ≥0.4.0 tools / ≥0.4.1 strict schemas, each with its silent-failure symptom), then install → `router.yaml` (incl. the shallow-probe/"Say OK" lesson) → run + `/healthz` + `/admin` → OpenAI client wiring → a three-check integration gate → CI ledger persistence → a troubleshooting table. `config.md` documents `router.yaml` (replace vs merge, plan modes, fleet/disabled/aliases, pacing, learning, env overrides) and alias/`x-gfr-tier` semantics; `ops-and-ci.md` carries the app-side fallback policy and the verified GitHub Actions wiring (ledger cache restore/save, health wait loop, SIGTERM flush, concurrency).
+- README: skill pointer in Quickstart; "version `0.2.0`" → `0.4.1` (published).
+- `llms.txt`: rewritten for v0.4.1 — vision, function calling + thoughtSignature, schema sanitizer, plan modes, dry-run, full endpoint list, built-in aliases.
+- `package.json` `files`: `"skills"` added, so the skill ships in the npm tarball next to `bin/`/`dist/`.
+
+**Verification** — `npm pack --dry-run` lists `skills/gemini-router/SKILL.md` + the two references in the tarball contents (prepack build green). Docs/packaging only — no `src/` or `test/` changes, so the 1.22 suite (113/113) stands.
