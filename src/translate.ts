@@ -3,7 +3,9 @@ import type {
   GeminiRequest,
   GeminiContent,
   GeminiPart,
+  GeminiFunctionDeclaration,
   ChatMessage,
+  OpenAIToolCall,
   OpenAIEmbeddingRequest,
   GeminiResponse,
 } from "./types.ts";
@@ -17,17 +19,53 @@ export interface EmbeddingUsage {
 export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
   const contents: GeminiContent[] = [];
   let systemParts: GeminiPart[] | undefined;
+  // tool_call_id → function name, filled while walking (an assistant
+  // tool_calls message always precedes its role:"tool" results), because
+  // OpenAI tool messages carry only the id — the name must be recovered here
+  // for the functionResponse Gemini expects.
+  const toolNameById = new Map<string, string>();
 
   for (const msg of req.messages ?? []) {
-    const parts = geminiPartsOf(msg.content);
     if (msg.role === "system") {
       // Live-verified: Gemini accepts inline_data inside systemInstruction.
+      const parts = geminiPartsOf(msg.content);
       systemParts = systemParts ? [...systemParts, ...parts] : parts;
-    } else if (msg.role === "assistant") {
-      contents.push({ role: "model", parts });
-    } else {
-      contents.push({ role: "user", parts });
+      continue;
     }
+    if (msg.role === "assistant") {
+      const calls = msg.tool_calls ?? [];
+      // A tool_calls turn typically has content: null — don't emit an empty
+      // text part next to the functionCall parts.
+      const parts = calls.length && msg.content == null ? [] : geminiPartsOf(msg.content);
+      for (const tc of calls) {
+        if (!tc?.function?.name) continue;
+        toolNameById.set(tc.id ?? "", tc.function.name);
+        // Gemini 3 demands its thought_signature back when a signed
+        // functionCall is replayed — re-attach what was remembered when this
+        // tool_call id was served (and Gemini's own functionCall id, which
+        // the signature covers).
+        const memo = tc.id ? callMemo.get(tc.id) : undefined;
+        const functionCall: GeminiPart["functionCall"] = {
+          name: tc.function.name,
+          args: parseToolArgs(tc.function.arguments),
+        };
+        if (memo?.geminiId) functionCall.id = memo.geminiId;
+        const part: GeminiPart = { functionCall };
+        if (memo?.signature) part.thoughtSignature = memo.signature;
+        parts.push(part);
+      }
+      contents.push({ role: "model", parts });
+      continue;
+    }
+    if (msg.role === "tool") {
+      const name = msg.name || toolNameById.get(msg.tool_call_id ?? "") || "tool";
+      contents.push({
+        role: "user",
+        parts: [{ functionResponse: { name, response: toolResponseOf(msg.content) } }],
+      });
+      continue;
+    }
+    contents.push({ role: "user", parts: geminiPartsOf(msg.content) });
   }
 
   const generationConfig: Record<string, unknown> = {};
@@ -39,7 +77,83 @@ export function openaiToGemini(req: OpenAIChatRequest): GeminiRequest {
   const out: GeminiRequest = { contents };
   if (systemParts) out.systemInstruction = { parts: systemParts };
   if (Object.keys(generationConfig).length) out.generationConfig = generationConfig;
+
+  // Function calling (v0.4.0). Before this existed `tools`/`tool_choice` were
+  // silently dropped — the model never saw the declarations, never called a
+  // function, and tool-driven agents (contentfte research/brief stages, CI
+  // 2026-10-15) received empty outputs. The router carries declarations and
+  // results only; executing tools stays the client's job.
+  const declarations: GeminiFunctionDeclaration[] = [];
+  for (const t of req.tools ?? []) {
+    if (t?.type !== "function" || !t.function?.name) continue;
+    const d: GeminiFunctionDeclaration = { name: t.function.name };
+    if (t.function.description) d.description = t.function.description;
+    if (t.function.parameters) d.parameters = t.function.parameters;
+    declarations.push(d);
+  }
+  // tool_choice "none" = the model must not call anything: omitting the
+  // declarations entirely is Gemini's strictest form of that.
+  if (declarations.length && req.tool_choice !== "none") {
+    out.tools = [{ functionDeclarations: declarations }];
+    const toolConfig = toolConfigOf(req.tool_choice);
+    if (toolConfig) out.toolConfig = toolConfig;
+  }
   return out;
+}
+
+/** OpenAI tool_call.arguments (a JSON string) → the object Gemini expects. */
+function parseToolArgs(args: string | undefined): Record<string, unknown> {
+  if (!args) return {};
+  try {
+    const v = JSON.parse(args);
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
+    return { value: v };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * OpenAI role:"tool" content → the Struct Gemini's functionResponse requires.
+ * JSON objects pass through as-is (that's the natural shape every SDK sends);
+ * anything else is wrapped in `output`, Google's own convention for
+ * non-Struct payloads.
+ */
+function toolResponseOf(content: ChatMessage["content"]): Record<string, unknown> {
+  let raw: unknown = content;
+  if (Array.isArray(content)) {
+    raw = content.map((p) => (typeof p?.text === "string" ? p.text : "")).join("");
+  }
+  if (raw == null) return {};
+  if (typeof raw !== "object") {
+    if (typeof raw === "string") {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+        return { output: parsed };
+      } catch {
+        return { output: raw };
+      }
+    }
+    return { output: raw };
+  }
+  if (Array.isArray(raw)) return { output: raw };
+  return raw as Record<string, unknown>;
+}
+
+/** OpenAI `tool_choice` → Gemini toolConfig; undefined when the default applies. */
+function toolConfigOf(choice: OpenAIChatRequest["tool_choice"]): GeminiRequest["toolConfig"] {
+  if (choice === "required") return { functionCallingConfig: { mode: "ANY" } };
+  if (choice && typeof choice === "object" && choice.function?.name) {
+    return {
+      functionCallingConfig: { mode: "ANY", allowedFunctionNames: [choice.function.name] },
+    };
+  }
+  // "auto"/unset → Gemini's AUTO is the default; "none" never reaches here
+  // (declarations are omitted above).
+  return undefined;
 }
 
 /** OpenAI content (string | parts array) → Gemini parts, images included. */
@@ -136,6 +250,7 @@ export function geminiToOpenAI(
   created = Math.floor(Date.now() / 1000),
 ) {
   const u = g.usageMetadata ?? {};
+  const toolCalls = functionCallsOf(g);
   const blocked = g.candidates?.[0]?.content?.parts?.[0]?.text
     ? !!(g.candidates?.[0]?.finishReason && g.candidates?.[0]?.finishReason !== "STOP")
     : !!(g.promptFeedback?.blockReason);
@@ -150,8 +265,14 @@ export function geminiToOpenAI(
         message: {
           role: "assistant",
           content: blocked ? null : textOfGemini(g),
+          // OpenAI-compatible clients (the Agents SDK included) read
+          // tool_calls off the message; without this mapping a Gemini
+          // functionCall part collapsed into an empty assistant message,
+          // the SDK had nothing to execute, and tool-driven runs ended
+          // with empty output (dev-log §1.21).
+          ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         },
-        finish_reason: blocked ? "content_filter" : "stop",
+        finish_reason: blocked ? "content_filter" : toolCalls.length ? "tool_calls" : "stop",
       },
     ],
     usage: {
@@ -160,6 +281,52 @@ export function geminiToOpenAI(
       total_tokens: u.totalTokenCount ?? 0,
     },
   };
+}
+
+/**
+ * OpenAI tool_call.id → Gemini's {id, thoughtSignature} from the response
+ * that produced it. Gemini 3 signs its functionCall parts and rejects the
+ * replay without the signature, but the OpenAI wire format has nowhere to
+ * carry one — so the router remembers its own generated id → signature and
+ * re-attaches it when the client echoes the id back. Bounded FIFO: oldest
+ * entries evict past the cap (a call is consumed within seconds-to-minutes;
+ * an idle cache never fills, and a mid-conversation router restart degrades
+ * to the upstream 400 → client's normal error fallback).
+ */
+const callMemo = new Map<string, { geminiId?: string; signature?: string }>();
+const CALL_MEMO_MAX = 4096;
+
+function rememberCall(id: string, geminiId?: string, signature?: string) {
+  if (!geminiId && !signature) return;
+  callMemo.set(id, { geminiId, signature });
+  while (callMemo.size > CALL_MEMO_MAX) {
+    const oldest = callMemo.keys().next().value;
+    if (oldest === undefined) break;
+    callMemo.delete(oldest);
+  }
+}
+
+/** Gemini functionCall parts → OpenAI `tool_calls` entries (v0.4.0). */
+function functionCallsOf(g: GeminiResponse): OpenAIToolCall[] {
+  const calls: OpenAIToolCall[] = [];
+  let i = 0;
+  for (const p of g.candidates?.[0]?.content?.parts ?? []) {
+    if (!p.functionCall?.name) continue;
+    // Unique within (and across) responses; the client echoes this id back
+    // on the assistant repeat + role:"tool" result, which openaiToGemini
+    // resolves to the function name and the memoized Gemini id/signature.
+    const id = `call_${completionId().replace("chatcmpl-", "")}_${i++}`;
+    rememberCall(id, p.functionCall.id, p.thoughtSignature);
+    calls.push({
+      id,
+      type: "function",
+      function: {
+        name: p.functionCall.name,
+        arguments: JSON.stringify(p.functionCall.args ?? {}),
+      },
+    });
+  }
+  return calls;
 }
 
 function textOfGemini(g: GeminiResponse): string {
@@ -193,7 +360,14 @@ export function geminiChunkToOpenAI(
   includeUsage: boolean,
 ) {
   const text = textOfGemini(g);
+  const toolCalls = functionCallsOf(g).map((tc, index) => ({ index, ...tc }));
   const done = !!g.candidates?.[0]?.finishReason;
+  // OpenAI streaming tool_calls deltas carry a running `index` (the client
+  // accumulates by it); Gemini delivers a functionCall part whole, so each
+  // one arrives as a single complete delta.
+  const delta: Record<string, unknown> = {};
+  if (text) delta.content = text;
+  if (toolCalls.length) delta.tool_calls = toolCalls;
   const chunk: Record<string, unknown> = {
     id,
     object: "chat.completion.chunk",
@@ -202,8 +376,8 @@ export function geminiChunkToOpenAI(
     choices: [
       {
         index: 0,
-        delta: text ? { content: text } : {},
-        finish_reason: done ? "stop" : null,
+        delta,
+        finish_reason: done ? (toolCalls.length ? "tool_calls" : "stop") : null,
       },
     ],
   };

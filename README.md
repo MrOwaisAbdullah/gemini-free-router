@@ -50,6 +50,7 @@ The image runs the router on `0.0.0.0:8787` (that binding is baked in via `GFR_H
 | **429s** | Parsed via forensics (`quotaId` + `quotaMetric` + `RetryInfo` + `limit:` in the message; on conflict `quotaMetric` wins over `quotaId`). Daily exhaustion → model done-for-day; minute throttle → honor `retryDelay` exactly (0s → 5s floor); unclassifiable payloads → capped exponential backoff (1s–60s, jittered); learned limits self-correct the fleet table |
 | **Fallback** | Models re-ranked continuously by remaining daily budget **× rolling quality** (EMA of success rate and latency); exhausted models drop out for the day |
 | **Vision** | OpenAI `image_url` parts translate to Gemini `inline_data` (base64 data URIs) or `file_data` (http/https/gs URLs, mime inferred from extension). Measured media cost is ~1100 tokens/image regardless of size, so the pre-call estimate is flat per image and corrected with the actual `promptTokenCount` after the call |
+| **Function calling** | OpenAI `tools`/`tool_choice` translate to Gemini `functionDeclarations`/`toolConfig`; `tool_calls` ⇄ `functionCall`/`functionResponse` in both directions (SSE deltas included), so agent SDKs keep their tool loops intact. Gemini 3's `thoughtSignature` is memoized per tool_call id and re-attached when the client replays the call (Gemini 400s a signed call replayed without it) |
 
 ## Endpoints
 

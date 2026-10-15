@@ -74,6 +74,26 @@ export interface LearningConfig {
   auto_apply: boolean;
 }
 
+export interface OpenAIFunctionDef {
+  name: string;
+  description?: string;
+  /** Plain JSON Schema (the shape every OpenAI-compatible SDK sends). */
+  parameters?: Record<string, unknown>;
+}
+
+/** OpenAI `tool_choice`: keyword, or pin one function. */
+export type OpenAIToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | { type?: string; function?: { name: string } };
+
+export interface OpenAIToolCall {
+  id: string;
+  type?: string;
+  function: { name: string; arguments: string };
+}
+
 export interface OpenAIChatRequest {
   model: string;
   messages: ChatMessage[];
@@ -84,6 +104,9 @@ export interface OpenAIChatRequest {
   stream?: boolean;
   stream_options?: { include_usage?: boolean };
   user?: string;
+  /** OpenAI function tools — translated to Gemini functionDeclarations (v0.4.0). */
+  tools?: Array<{ type?: string; function?: OpenAIFunctionDef }>;
+  tool_choice?: OpenAIToolChoice;
 }
 
 export interface OpenAIEmbeddingRequest {
@@ -100,6 +123,12 @@ export interface ChatMessage {
     | string
     | Array<{ type: string; text?: string; image_url?: { url?: string; detail?: string } }>
     | null;
+  /** assistant turns: the functions the model asked the client to execute. */
+  tool_calls?: OpenAIToolCall[];
+  /** tool turns: which call this answers (its id is how the name is recovered). */
+  tool_call_id?: string;
+  /** optional function name on a tool message (clients that send it). */
+  name?: string;
 }
 
 /**
@@ -111,6 +140,15 @@ export interface GeminiPart {
   text?: string;
   inline_data?: { mime_type: string; data: string };
   file_data?: { file_uri: string; mime_type?: string };
+  /** Function calling (v0.4.0): model→client call, client→model result. */
+  functionCall?: { name: string; args?: Record<string, unknown>; id?: string };
+  functionResponse?: { name: string; response: Record<string, unknown> };
+  /**
+   * Gemini 3 signs functionCall parts and 400s a replay that lacks the
+   * signature ("Function call is missing a thought_signature") — re-attached
+   * on replay because the OpenAI wire has nowhere to carry it (see callMemo).
+   */
+  thoughtSignature?: string;
 }
 
 export interface GeminiContent {
@@ -118,15 +156,33 @@ export interface GeminiContent {
   parts: GeminiPart[];
 }
 
+/** One Gemini `functionDeclarations` entry (name/description/parameters JSON Schema). */
+export interface GeminiFunctionDeclaration {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+}
+
 export interface GeminiRequest {
   contents: GeminiContent[];
   systemInstruction?: { parts: GeminiPart[] };
   generationConfig?: Record<string, unknown>;
+  tools?: Array<{ functionDeclarations: GeminiFunctionDeclaration[] }>;
+  /** Absent = Gemini's AUTO default; set for tool_choice required/pinned. */
+  toolConfig?: {
+    functionCallingConfig: { mode?: "AUTO" | "ANY" | "NONE"; allowedFunctionNames?: string[] };
+  };
 }
 
 export interface GeminiResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text: string }> };
+    content?: {
+      parts?: Array<{
+        text?: string;
+        functionCall?: { name: string; args?: Record<string, unknown>; id?: string };
+        thoughtSignature?: string;
+      }>;
+    };
     finishReason?: string;
   }>;
   usageMetadata?: {
