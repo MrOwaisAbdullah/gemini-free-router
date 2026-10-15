@@ -19,7 +19,8 @@
   "files": [
     "bin",
     "dist",
-    "router.example.yaml"
+    "router.example.yaml",
+    "skills"
   ],
   "scripts": {
     "start": "node src/cli.ts",

@@ -31,6 +31,11 @@ print(client.chat.completions.create(
 ).choices[0].message.content)
 ```
 
+> **AI agents:** [`skills/gemini-router/SKILL.md`](./skills/gemini-router/SKILL.md)
+> is an integration skill for this package — install, `router.yaml`, client
+> wiring, the version floors that fail silently (≥0.3.0 vision, ≥0.4.0 function
+> calling, ≥0.4.1 strict schemas), and persisting the quota ledger in CI.
+
 ### Docker
 
 ```bash
@@ -140,7 +145,7 @@ The published package ships compiled JavaScript in `dist/` (Node refuses to stri
 TypeScript from files under `node_modules`); `npm pack`/`npm publish` build it
 automatically via the `prepack` script.
 
-**Package**: `npm i gemini-free-router` — version `0.2.0`, published to npmjs.com.
+**Package**: `npm i gemini-free-router` — version `0.4.1`, published to npmjs.com.
 
 429 classification is regression-tested against a golden fixture corpus in `test/fixtures/` (day, minute, token-minute, `retryDelay: 0s`, missing `details`, ambiguous) — when Google changes an error shape, drop the payload in there and add its expectations to `test/fixtures/429-corpus.json`.
 
